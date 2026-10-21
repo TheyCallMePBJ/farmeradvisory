@@ -200,11 +200,39 @@ async def generate_speech_audio(text: str, lang: str = "mr") -> bytes | None:
         return None
     try:
         voice = TTS_VOICES.get(lang, TTS_VOICES["mr"])
-        # Clean formatting, bold asterisks, and bullet emojis so speech flows naturally
+
+        # 1. Strip markdown formatting and emojis
         clean_text = re.sub(r'[*_#~`]', '', text)
-        clean_text = re.sub(r'[🍇✅⚠️📅•\-]', '', clean_text)
-        clean_text = re.sub(r'[ \t]+', ' ', clean_text).strip()
-        communicate = edge_tts.Communicate(clean_text, voice)
+        clean_text = re.sub(r'[🍇✅⚠️📅•]', '', clean_text)
+
+        # 2. Phonetic expansion of units, dosages, and weather for natural, accurate pronunciation
+        if lang == "mr":
+            clean_text = re.sub(r'°C|°से\.?', ' अंश सेल्सिअस ', clean_text)
+            clean_text = re.sub(r'%', ' टक्के ', clean_text)
+            clean_text = re.sub(r'किमी/तास|कि\.मी\./तास|km/h', ' किलोमीटर प्रति तास ', clean_text)
+            clean_text = re.sub(r'\s*/\s*', ' प्रति ', clean_text)
+        elif lang == "hi":
+            clean_text = re.sub(r'°C|°से\.?', ' डिग्री सेल्सियस ', clean_text)
+            clean_text = re.sub(r'%', ' प्रतिशत ', clean_text)
+            clean_text = re.sub(r'किमी/घंटा|km/h', ' किलोमीटर प्रति घंटा ', clean_text)
+            clean_text = re.sub(r'\s*/\s*', ' प्रति ', clean_text)
+        else:
+            clean_text = re.sub(r'°C', ' degrees Celsius ', clean_text)
+            clean_text = re.sub(r'%', ' percent ', clean_text)
+            clean_text = re.sub(r'km/h', ' kilometers per hour ', clean_text)
+            clean_text = re.sub(r'\s*/\s*', ' per ', clean_text)
+
+        # 3. Clean remaining brackets, bullets, and colons into natural speech pauses
+        clean_text = re.sub(r'[\(\)]', ' ', clean_text)
+        clean_text = re.sub(r':\s*', '. ', clean_text)
+        clean_text = re.sub(r'^\s*[-*•]\s*', ', ', clean_text, flags=re.MULTILINE)
+        clean_text = re.sub(r'\n+', '. ', clean_text)
+        clean_text = re.sub(r'[ \t]+', ' ', clean_text)
+        clean_text = re.sub(r'\s*,\s*\.', '.', clean_text)
+        clean_text = re.sub(r'\.+', '.', clean_text).strip()
+
+        # rate="-4%" produces a natural, composed speaking pace for technical dosages
+        communicate = edge_tts.Communicate(clean_text, voice, rate="-4%")
         audio_buffer = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -338,13 +366,28 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
     else:
         weather_text = f"- District: {district} (Live weather unavailable)"
 
-    if target_lang == "mr":
+    is_audio = isinstance(user_input, bytes)
+    if is_audio:
+        disease_names = "केवडा आणि भुरी (मराठीत) किंवा Downy Mildew / Powdery Mildew"
+        lang_rule = f"""AUDIO VOICE NOTE LANGUAGE MANDATE (CRITICAL):
+- Carefully listen to the farmer's spoken audio.
+- You MUST answer in the EXACT SAME language spoken by the farmer in the voice note:
+  * If the farmer speaks Marathi (मराठी) -> Answer 100% in pure Marathi (देवनागरी). NEVER use English. Write ONLY 'केवडा' and 'भुरी'.
+  * If the farmer speaks Hindi (हिंदी) -> Answer 100% in pure Hindi (देवनागरी). NEVER use English.
+  * If the farmer speaks English -> Answer 100% in clear English.
+- If the language in the audio is unclear, strictly default to the farmer's registered language: '{default_lang}'.
+- ABSOLUTELY NO GREETINGS. Jump straight into the direct advice in the spoken language."""
+        length_rule = "2. Ultra-Concise Voice Mode: Provide an ultra-short, direct response under 35-40 words (maximum 1-2 punchy sentences with exact spray dose per 200L tank or acre). Do not provide lengthy explanations."
+        max_tokens = 220
+    elif target_lang == "mr":
         disease_names = "केवडा आणि भुरी"
         lang_rule = """भाषा नियम (अत्यंत महत्त्वाचे - १००% शुद्ध मराठी):
 - संपूर्ण उत्तर १००% शुद्ध मराठी भाषेत आणि देवनागरी लिपीतच लिहा.
 - कोणतेही इंग्रजी शब्द किंवा लॅटिन अक्षरे वापरणे पूर्णपणे वर्ज्य आहे.
 - कंसात इंग्रजी भाषांतर कधीही लिहू नका (उदा. 'केवडा (Downy Mildew)' किंवा 'भुरी (Powdery Mildew)' असे अजिबात लिहू नका; फक्त '*केवडा*' आणि '*भुरी*' असेच लिहा).
 - औषधांची नावे, प्रमाण आणि स्वरूप मराठीत लिहा (उदा. '८०% विद्राव्य गंधक भुकटी', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). 'WDG', 'SC', 'ml', 'gm' अशी इंग्रजी अक्षरे वापरू नका."""
+        length_rule = "2. Direct & Actionable: Keep the reply concise and practical (maximum 60-75 words, 3 to 4 short bullet points)."
+        max_tokens = 450
     elif target_lang == "hi":
         disease_names = "केवड़ा और भूरी"
         lang_rule = """भाषा नियम (अति महत्वपूर्ण - १००% शुद्ध हिंदी):
@@ -352,6 +395,8 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
 - अंग्रेजी शब्दों या लैटिन अक्षरों का प्रयोग पूर्णतः वर्जित है।
 - कोष्ठक में अंग्रेजी नाम न लिखें (उदा. केवल '*केवड़ा*' और '*भूरी*' लिखें; 'Downy Mildew' या 'Powdery Mildew' बिल्कुल न लिखें)।
 - दवाओं के नाम, मात्रा और इकाइयाँ हिंदी में लिखें (उदा. '८०% डब्लूडीजी', '५% एससी', 'मिली', 'ग्राम', 'प्रति २०० लीटर पानी')."""
+        length_rule = "2. Direct & Actionable: Keep the reply concise and practical (maximum 60-75 words, 3 to 4 short bullet points)."
+        max_tokens = 450
     else:
         disease_names = "Downy Mildew and Powdery Mildew"
         lang_rule = """LANGUAGE PURITY MANDATE (100% PURE ENGLISH):
@@ -360,12 +405,6 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
 - Write ONLY 'Downy Mildew' (NEVER 'Downy Mildew (केवडा)').
 - Write ONLY 'Powdery Mildew' (NEVER 'Powdery Mildew (भुरी)').
 - Do NOT mix any Indian language words into English responses."""
-
-    is_audio = isinstance(user_input, bytes)
-    if is_audio:
-        length_rule = "2. Ultra-Concise Voice Mode: Provide an ultra-short, direct response under 35-45 words (maximum 1-2 punchy sentences with exact spray dose per 200L tank or acre). Do not provide lengthy explanations."
-        max_tokens = 220
-    else:
         length_rule = "2. Direct & Actionable: Keep the reply concise and practical (maximum 60-75 words, 3 to 4 short bullet points)."
         max_tokens = 450
 
@@ -416,7 +455,9 @@ STRICT INSTRUCTIONS:
             role="user",
             parts=[
                 types.Part.from_bytes(data=user_input, mime_type=mime_type),
-                types.Part.from_text(text="Direct ultra-concise advice for farmer in under 40 words, no greetings:")
+                types.Part.from_text(
+                    text="Listen to this voice note from a farmer. Answer in the EXACT language spoken (if Marathi -> 100% Marathi; if Hindi -> 100% Hindi; if English -> 100% English). Direct viticulture advice under 35 words, no greetings:"
+                )
             ]
         ))
     else:
@@ -458,7 +499,8 @@ STRICT INSTRUCTIONS:
                     reply_text = "".join(p.text for p in res.candidates[0].content.parts if getattr(p, "text", None)).strip()
 
                 if reply_text:
-                    cleaned = clean_language_output(reply_text, target_lang)
+                    reply_lang = detect_query_language(reply_text, default_lang=target_lang)
+                    cleaned = clean_language_output(reply_text, reply_lang)
                     return cleaned
 
             except asyncio.TimeoutError:
@@ -611,9 +653,9 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
             # If user sent a voice note, respond with both text and voice note
             if msg_type == "audio" and not bot_reply.startswith("क्षमस्व") and not bot_reply.startswith("क्षमा") and not bot_reply.startswith("Sorry"):
                 try:
-                    farmer_lang = farmer.get("language", "mr")
-                    logger.info(f"Synthesizing voice response using Edge TTS in '{farmer_lang}'")
-                    audio_reply_bytes = await generate_speech_audio(bot_reply, lang=farmer_lang)
+                    voice_lang = detect_query_language(bot_reply, default_lang=farmer.get("language", "mr"))
+                    logger.info(f"Synthesizing voice response using Edge TTS in '{voice_lang}'")
+                    audio_reply_bytes = await generate_speech_audio(bot_reply, lang=voice_lang)
                     if audio_reply_bytes:
                         uploaded_id = await upload_whatsapp_media(audio_reply_bytes, mime_type="audio/mpeg")
                         if uploaded_id:
