@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import time
 import asyncio
+import logging
 from collections import defaultdict
 from datetime import datetime
 import httpx
@@ -14,6 +16,14 @@ from google.genai import types
 import database as db
 
 load_dotenv()
+
+# --- Logging Configuration (Ensures immediate unbuffered output on Render) ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("krishi_saathi")
 
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
@@ -72,21 +82,44 @@ STRINGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting up Krishi Saathi WhatsApp Bot...")
     await db.init_db()
+    logger.info(f"Database initialized: {db.DB_NAME}")
+    logger.info(f"Configuration check: META_ACCESS_TOKEN={'SET' if META_ACCESS_TOKEN else 'MISSING'}, PHONE_NUMBER_ID={PHONE_NUMBER_ID or 'MISSING'}, VERIFY_TOKEN={'SET' if VERIFY_TOKEN else 'MISSING'}, GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}, OPENWEATHER_API_KEY={'SET' if OPENWEATHER_API_KEY else 'MISSING'}")
     yield
+    logger.info("Shutting down Krishi Saathi...")
 
 app = FastAPI(lifespan=lifespan)
 
+# --- Health Check Endpoint (For Render & Browser verification) ---
+@app.get("/")
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "service": "Krishi Saathi WhatsApp Bot",
+        "phone_number_id_configured": bool(PHONE_NUMBER_ID),
+        "meta_token_configured": bool(META_ACCESS_TOKEN),
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "weather_configured": bool(OPENWEATHER_API_KEY)
+    }
+
 # --- WhatsApp API Outbound Helpers ---
 async def send_whatsapp(payload: dict):
+    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        logger.error("Cannot send message: META_ACCESS_TOKEN or PHONE_NUMBER_ID is not configured in environment variables!")
+        return
+
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=10.0)
+            r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=12.0)
             if r.status_code >= 400:
-                print(f"[Meta Outbound Error] {r.status_code}: {r.text}")
+                logger.error(f"[Meta Outbound Error {r.status_code}]: {r.text}")
+            else:
+                logger.info("[Meta Outbound Success]: WhatsApp message sent successfully")
         except Exception as e:
-            print(f"[Meta Exception]: {e}")
+            logger.exception(f"[Meta Outbound Exception]: {e}")
 
 async def send_text(to: str, text: str):
     await send_whatsapp({"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}})
@@ -247,82 +280,95 @@ def validate_pruning_date(date_str: str) -> bool:
 
 async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
     async with user_locks[sender]:
-        farmer = await db.get_farmer(sender)
+        try:
+            logger.info(f"Processing incoming message (type={msg_type})")
+            farmer = await db.get_farmer(sender)
 
-        # 1. First-time user or manual reset
-        text_content = raw_data.get("text", {}).get("body", "").strip() if msg_type == "text" else ""
-        if not farmer or text_content.lower() in ["reset", "restart", "start"]:
-            await start_language_selection(sender)
-            return
-
-        # 2. In Onboarding Flow
-        if not farmer.get("onboarding_complete", 0):
-            step = farmer.get("onboarding_step", "AWAITING_LANG")
-            lang = farmer.get("language", "mr")
-            s = STRINGS.get(lang, STRINGS["mr"])
-
-            # Step 1: Language selection
-            if step == "AWAITING_LANG":
-                btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
-                lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
-                chosen_lang = lang_map.get(btn_id, "mr")
-                await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
-                
-                next_strings = STRINGS[chosen_lang]
-                await send_list(sender, next_strings["variety_title"], next_strings["btn_variety"], next_strings["varieties"])
+            # 1. First-time user or manual reset
+            text_content = raw_data.get("text", {}).get("body", "").strip() if msg_type == "text" else ""
+            if not farmer or text_content.lower() in ["reset", "restart", "start"]:
+                logger.info("Starting onboarding / language selection")
+                await start_language_selection(sender)
                 return
 
-            # Step 2: Variety selection
-            if step == "AWAITING_VARIETY":
-                list_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
-                var_map = {"VAR_THOMPSON": "Thompson Seedless", "VAR_MANIK": "Manik Chaman", "VAR_SHARAD": "Sharad Seedless", "VAR_SONAKA": "Sonaka"}
-                chosen_var = var_map.get(list_id, "Thompson Seedless")
-                await db.save_or_update_farmer(sender, variety=chosen_var, onboarding_step="AWAITING_DISTRICT")
-                
-                await send_list(sender, s["dist_title"], s["btn_dist"], s["districts"])
+            # 2. In Onboarding Flow
+            if not farmer.get("onboarding_complete", 0):
+                step = farmer.get("onboarding_step", "AWAITING_LANG")
+                lang = farmer.get("language", "mr")
+                s = STRINGS.get(lang, STRINGS["mr"])
+                logger.info(f"Onboarding step: {step}")
+
+                # Step 1: Language selection
+                if step == "AWAITING_LANG":
+                    btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
+                    lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
+                    chosen_lang = lang_map.get(btn_id, "mr")
+                    await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
+                    
+                    next_strings = STRINGS[chosen_lang]
+                    await send_list(sender, next_strings["variety_title"], next_strings["btn_variety"], next_strings["varieties"])
+                    return
+
+                # Step 2: Variety selection
+                if step == "AWAITING_VARIETY":
+                    list_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
+                    var_map = {"VAR_THOMPSON": "Thompson Seedless", "VAR_MANIK": "Manik Chaman", "VAR_SHARAD": "Sharad Seedless", "VAR_SONAKA": "Sonaka"}
+                    chosen_var = var_map.get(list_id, "Thompson Seedless")
+                    await db.save_or_update_farmer(sender, variety=chosen_var, onboarding_step="AWAITING_DISTRICT")
+                    
+                    await send_list(sender, s["dist_title"], s["btn_dist"], s["districts"])
+                    return
+
+                # Step 3: District selection
+                if step == "AWAITING_DISTRICT":
+                    dist_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
+                    d_map = {"DIST_NASHIK": "Nashik", "DIST_SANGLI": "Sangli", "DIST_PUNE": "Pune"}
+                    chosen_dist = d_map.get(dist_id, "Nashik")
+                    await db.save_or_update_farmer(sender, district=chosen_dist, onboarding_step="AWAITING_PRUNING_DATE")
+                    
+                    await send_text(sender, s["pruning_prompt"])
+                    return
+
+                # Step 4: Pruning date
+                if step == "AWAITING_PRUNING_DATE":
+                    if msg_type == "text" and validate_pruning_date(text_content):
+                        await db.save_or_update_farmer(sender, pruning_date=text_content.strip(), onboarding_complete=1, onboarding_step="COMPLETED")
+                        await send_text(sender, s["setup_done"])
+                    else:
+                        await send_text(sender, s["invalid_date"])
+                    return
+
+            # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
+            history = await db.get_recent_history(sender, limit=2)
+            user_log = ""
+            bot_reply = ""
+
+            if msg_type == "text":
+                user_log = text_content
+                logger.info("Generating advisory response with Gemini")
+                bot_reply = await query_gemini_fast(farmer, history, text_content)
+
+            elif msg_type == "audio":
+                media_id = raw_data.get("audio", {}).get("id")
+                logger.info("Processing incoming audio note with Gemini")
+                audio_bytes, mime = await download_media(media_id)
+                user_log = "[Audio Note]"
+                bot_reply = await query_gemini_fast(farmer, history, audio_bytes, mime_type=mime)
+
+            else:
+                await send_text(sender, "कृपया प्रश्न मजकूर (text) किंवा व्हॉइस नोट (audio) द्वारे पाठवा.")
                 return
 
-            # Step 3: District selection
-            if step == "AWAITING_DISTRICT":
-                dist_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
-                d_map = {"DIST_NASHIK": "Nashik", "DIST_SANGLI": "Sangli", "DIST_PUNE": "Pune"}
-                chosen_dist = d_map.get(dist_id, "Nashik")
-                await db.save_or_update_farmer(sender, district=chosen_dist, onboarding_step="AWAITING_PRUNING_DATE")
-                
-                await send_text(sender, s["pruning_prompt"])
-                return
+            await send_text(sender, bot_reply)
+            await db.save_chat_turn(sender, "user", user_log)
+            await db.save_chat_turn(sender, "model", bot_reply)
 
-            # Step 4: Pruning date
-            if step == "AWAITING_PRUNING_DATE":
-                if msg_type == "text" and validate_pruning_date(text_content):
-                    await db.save_or_update_farmer(sender, pruning_date=text_content.strip(), onboarding_complete=1, onboarding_step="COMPLETED")
-                    await send_text(sender, s["setup_done"])
-                else:
-                    await send_text(sender, s["invalid_date"])
-                return
-
-        # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
-        history = await db.get_recent_history(sender, limit=2)
-        user_log = ""
-        bot_reply = ""
-
-        if msg_type == "text":
-            user_log = text_content
-            bot_reply = await query_gemini_fast(farmer, history, text_content)
-
-        elif msg_type == "audio":
-            media_id = raw_data.get("audio", {}).get("id")
-            audio_bytes, mime = await download_media(media_id)
-            user_log = "[Audio Note]"
-            bot_reply = await query_gemini_fast(farmer, history, audio_bytes, mime_type=mime)
-
-        else:
-            await send_text(sender, "कृपया प्रश्न मजकूर (text) किंवा व्हॉइस नोट (audio) द्वारे पाठवा.")
-            return
-
-        await send_text(sender, bot_reply)
-        await db.save_chat_turn(sender, "user", user_log)
-        await db.save_chat_turn(sender, "model", bot_reply)
+        except Exception as e:
+            logger.exception(f"Unhandled error in dispatch_message: {e}")
+            try:
+                await send_text(sender, "क्षमस्व, तांत्रिक अडचण आली आहे. कृपया थोड्या वेळाने प्रयत्न करा.")
+            except Exception:
+                pass
 
 # --- Webhook Endpoints ---
 @app.get("/webhook")
@@ -332,30 +378,48 @@ async def verify(
     hub_challenge: str = Query(None, alias="hub.challenge"),
 ):
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        logger.info("Webhook verification SUCCESSFUL!")
         return Response(content=hub_challenge, media_type="text/plain", status_code=200)
+    logger.warning("Webhook verification FAILED (token mismatch)")
     return Response(content="Failed", status_code=403)
 
 @app.post("/webhook")
 async def receive(request: Request, bg: BackgroundTasks):
-    data = await request.json()
     try:
-        messages = data.get("entry", [])[0].get("changes", [])[0].get("value", {}).get("messages", [])
-        if messages:
-            msg = messages[0]
-            msg_id = msg.get("id")
-            now = time.time()
-            if msg_id:
-                # Evict expired message IDs to bound memory
-                if len(processed_msg_ids) > 1000:
-                    cutoff = now - MSG_ID_TTL
-                    expired = [mid for mid, ts in processed_msg_ids.items() if ts < cutoff]
-                    for mid in expired:
-                        del processed_msg_ids[mid]
-                if msg_id in processed_msg_ids:
-                    return {"status": "ignored_duplicate"}
-                processed_msg_ids[msg_id] = now
-
-            bg.add_task(dispatch_message, msg.get("from"), msg.get("type"), msg)
+        data = await request.json()
     except Exception as e:
-        print("Webhook error:", e)
+        logger.error(f"Webhook POST: Invalid JSON received: {e}")
+        return {"status": "invalid_json"}
+
+    try:
+        entries = data.get("entry", [])
+        if not entries:
+            return {"status": "ok"}
+
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+
+                for msg in messages:
+                    msg_id = msg.get("id")
+                    sender = msg.get("from")
+                    msg_type = msg.get("type")
+                    now = time.time()
+
+                    if msg_id:
+                        if len(processed_msg_ids) > 1000:
+                            cutoff = now - MSG_ID_TTL
+                            expired = [mid for mid, ts in processed_msg_ids.items() if ts < cutoff]
+                            for mid in expired:
+                                del processed_msg_ids[mid]
+                        if msg_id in processed_msg_ids:
+                            continue
+                        processed_msg_ids[msg_id] = now
+
+                    bg.add_task(dispatch_message, sender, msg_type, msg)
+
+    except Exception as e:
+        logger.exception(f"Error handling webhook POST: {e}")
+
     return {"status": "ok"}
