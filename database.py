@@ -51,6 +51,12 @@ async def save_or_update_farmer(phone: str, **kwargs):
             await db.execute(query, values)
         await db.commit()
 
+async def reset_farmer(phone: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM chat_history WHERE phone_number = ?", (phone,))
+        await db.execute("DELETE FROM farmers WHERE phone_number = ?", (phone,))
+        await db.commit()
+
 async def save_chat_turn(phone: str, role: str, content: str):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(

@@ -445,7 +445,15 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
             if msg_id:
                 asyncio.create_task(mark_as_read(msg_id))
 
-            if not farmer or text_content.lower() in ["reset", "restart", "start"]:
+            # 1. Silent reset: clears user profile & chat history without sending any message
+            if text_content.lower() in ["reset", "restart"]:
+                logger.info(f"Silently resetting user {sender} data")
+                await db.reset_farmer(sender)
+                last_user_queries.pop(sender, None)
+                return
+
+            # 2. First-time user (or freshly reset user sending their next message, e.g. 'hi')
+            if not farmer or text_content.lower() == "start":
                 logger.info("Starting onboarding / language selection")
                 await start_language_selection(sender)
                 return
