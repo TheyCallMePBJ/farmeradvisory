@@ -1,5 +1,8 @@
 import os
 import re
+import time
+import asyncio
+from collections import defaultdict
 from datetime import datetime
 import httpx
 from contextlib import asynccontextmanager
@@ -16,10 +19,19 @@ META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
 GRAPH_API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+# --- Concurrency & Weather Cache ---
+user_locks = defaultdict(asyncio.Lock)
+processed_msg_ids: dict[str, float] = {}
+MSG_ID_TTL = 300  # 5 minutes
+
+weather_cache: dict[str, dict] = {}
+WEATHER_CACHE_TTL = 1800  # 30 minutes
 
 # --- Multilingual UI Strings Dictionary ---
 STRINGS = {
@@ -106,19 +118,71 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
         audio_stream = await client.get(data.get("url"), headers=headers, timeout=20.0)
         return audio_stream.content, data.get("mime_type", "audio/ogg").split(";")[0]
 
+# --- Weather API Helper ---
+async def get_district_weather(district: str) -> dict | None:
+    if not OPENWEATHER_API_KEY:
+        return None
+
+    now = time.time()
+    cached = weather_cache.get(district)
+    if cached and (now - cached["timestamp"] < WEATHER_CACHE_TTL):
+        return cached["data"]
+
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {
+        "q": f"{district},IN",
+        "appid": OPENWEATHER_API_KEY,
+        "units": "metric"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params, timeout=5.0)
+            if r.status_code == 200:
+                data = r.json()
+                weather_info = {
+                    "temp": round(data.get("main", {}).get("temp", 0), 1),
+                    "humidity": data.get("main", {}).get("humidity", 0),
+                    "condition": data.get("weather", [{}])[0].get("description", "Clear"),
+                    "rain_1h": data.get("rain", {}).get("1h", 0),
+                    "wind_speed": round(data.get("wind", {}).get("speed", 0) * 3.6, 1),
+                }
+                weather_cache[district] = {"timestamp": now, "data": weather_info}
+                return weather_info
+            else:
+                print(f"[OpenWeather Error] {r.status_code}: {r.text}")
+    except Exception as e:
+        print(f"[OpenWeather Exception]: {e}")
+
+    return cached["data"] if cached else None
+
 # --- Gemini Query Handler (Fast & Direct) ---
 async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str | bytes, mime_type: str = "text/plain") -> str:
+    district = farmer.get("district", "Nashik")
+    weather = await get_district_weather(district)
+
+    if weather:
+        weather_text = (
+            f"- Live Weather in {district}: Temp {weather['temp']}°C, "
+            f"Humidity {weather['humidity']}%, Condition: '{weather['condition']}', "
+            f"Rain (last 1h): {weather['rain_1h']}mm, Wind: {weather['wind_speed']} km/h"
+        )
+    else:
+        weather_text = f"- District: {district} (Live weather unavailable)"
+
     system_instruction = f"""
 You are 'Krishi Saathi' (कृषी साथी), a specialist agricultural advisor for grape farmers in Maharashtra, India.
 Farmer Details:
-- District: {farmer.get('district', 'Nashik')}
+- District: {district}
+{weather_text}
 - Grape Variety: {farmer.get('variety', 'Thompson Seedless')}
 - Pruning Date: {farmer.get('pruning_date', 'Not specified')}
 
 Strict Rules:
 1. Always respond in the EXACT same language the user asks in (Marathi, Hindi, or English).
 2. Use single asterisks for *bold*. Never use '#', '##', or tables.
-3. Keep the reply direct, concise, and under 100 words. Give exact chemical/organic doses per 200L water tank or per acre.
+3. Keep the reply direct, concise, and actionable (under 75 words, maximum 3-4 bullet points).
+4. When advising on spraying, always give exact chemical or organic doses per 200L water tank or per acre.
+5. Use the live weather context (humidity, rain, temp, wind) to assess disease risks (like Downy Mildew / केवडा if humidity >80% or rain, Powdery Mildew / भुरी if moderate temp and morning humidity) and spraying suitability (e.g. avoid spraying if wind >15 km/h or rain is imminent).
 """
     contents = []
     # Include up to 2 prior turns only to keep prompt lean and fast
@@ -147,10 +211,10 @@ Strict Rules:
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=0.2,
-            max_output_tokens=350,
+            max_output_tokens=300,
             thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
-        res = ai_client.models.generate_content(
+        res = await ai_client.aio.models.generate_content(
             model="gemini-3.8-flash",
             contents=contents,
             config=config,
@@ -182,82 +246,83 @@ def validate_pruning_date(date_str: str) -> bool:
         return False
 
 async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
-    farmer = await db.get_farmer(sender)
+    async with user_locks[sender]:
+        farmer = await db.get_farmer(sender)
 
-    # 1. First-time user or manual reset
-    text_content = raw_data.get("text", {}).get("body", "").strip() if msg_type == "text" else ""
-    if not farmer or text_content.lower() in ["reset", "restart", "start"]:
-        await start_language_selection(sender)
-        return
-
-    # 2. In Onboarding Flow but when I tried to send a message not too long after receiving a reply for the first, it gave me the exception 
-    if not farmer.get("onboarding_complete", 0):
-        step = farmer.get("onboarding_step", "AWAITING_LANG")
-        lang = farmer.get("language", "mr")
-        s = STRINGS.get(lang, STRINGS["mr"])
-
-        # Step 1: Language selection
-        if step == "AWAITING_LANG":
-            btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
-            lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
-            chosen_lang = lang_map.get(btn_id, "mr")
-            await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
-            
-            next_strings = STRINGS[chosen_lang]
-            await send_list(sender, next_strings["variety_title"], next_strings["btn_variety"], next_strings["varieties"])
+        # 1. First-time user or manual reset
+        text_content = raw_data.get("text", {}).get("body", "").strip() if msg_type == "text" else ""
+        if not farmer or text_content.lower() in ["reset", "restart", "start"]:
+            await start_language_selection(sender)
             return
 
-        # Step 2: Variety selection
-        if step == "AWAITING_VARIETY":
-            list_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
-            var_map = {"VAR_THOMPSON": "Thompson Seedless", "VAR_MANIK": "Manik Chaman", "VAR_SHARAD": "Sharad Seedless", "VAR_SONAKA": "Sonaka"}
-            chosen_var = var_map.get(list_id, "Thompson Seedless")
-            await db.save_or_update_farmer(sender, variety=chosen_var, onboarding_step="AWAITING_DISTRICT")
-            
-            await send_list(sender, s["dist_title"], s["btn_dist"], s["districts"])
+        # 2. In Onboarding Flow
+        if not farmer.get("onboarding_complete", 0):
+            step = farmer.get("onboarding_step", "AWAITING_LANG")
+            lang = farmer.get("language", "mr")
+            s = STRINGS.get(lang, STRINGS["mr"])
+
+            # Step 1: Language selection
+            if step == "AWAITING_LANG":
+                btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
+                lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
+                chosen_lang = lang_map.get(btn_id, "mr")
+                await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
+                
+                next_strings = STRINGS[chosen_lang]
+                await send_list(sender, next_strings["variety_title"], next_strings["btn_variety"], next_strings["varieties"])
+                return
+
+            # Step 2: Variety selection
+            if step == "AWAITING_VARIETY":
+                list_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
+                var_map = {"VAR_THOMPSON": "Thompson Seedless", "VAR_MANIK": "Manik Chaman", "VAR_SHARAD": "Sharad Seedless", "VAR_SONAKA": "Sonaka"}
+                chosen_var = var_map.get(list_id, "Thompson Seedless")
+                await db.save_or_update_farmer(sender, variety=chosen_var, onboarding_step="AWAITING_DISTRICT")
+                
+                await send_list(sender, s["dist_title"], s["btn_dist"], s["districts"])
+                return
+
+            # Step 3: District selection
+            if step == "AWAITING_DISTRICT":
+                dist_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
+                d_map = {"DIST_NASHIK": "Nashik", "DIST_SANGLI": "Sangli", "DIST_PUNE": "Pune"}
+                chosen_dist = d_map.get(dist_id, "Nashik")
+                await db.save_or_update_farmer(sender, district=chosen_dist, onboarding_step="AWAITING_PRUNING_DATE")
+                
+                await send_text(sender, s["pruning_prompt"])
+                return
+
+            # Step 4: Pruning date
+            if step == "AWAITING_PRUNING_DATE":
+                if msg_type == "text" and validate_pruning_date(text_content):
+                    await db.save_or_update_farmer(sender, pruning_date=text_content.strip(), onboarding_complete=1, onboarding_step="COMPLETED")
+                    await send_text(sender, s["setup_done"])
+                else:
+                    await send_text(sender, s["invalid_date"])
+                return
+
+        # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
+        history = await db.get_recent_history(sender, limit=2)
+        user_log = ""
+        bot_reply = ""
+
+        if msg_type == "text":
+            user_log = text_content
+            bot_reply = await query_gemini_fast(farmer, history, text_content)
+
+        elif msg_type == "audio":
+            media_id = raw_data.get("audio", {}).get("id")
+            audio_bytes, mime = await download_media(media_id)
+            user_log = "[Audio Note]"
+            bot_reply = await query_gemini_fast(farmer, history, audio_bytes, mime_type=mime)
+
+        else:
+            await send_text(sender, "कृपया प्रश्न मजकूर (text) किंवा व्हॉइस नोट (audio) द्वारे पाठवा.")
             return
 
-        # Step 3: District selection
-        if step == "AWAITING_DISTRICT":
-            dist_id = raw_data.get("interactive", {}).get("list_reply", {}).get("id", "")
-            d_map = {"DIST_NASHIK": "Nashik", "DIST_SANGLI": "Sangli", "DIST_PUNE": "Pune"}
-            chosen_dist = d_map.get(dist_id, "Nashik")
-            await db.save_or_update_farmer(sender, district=chosen_dist, onboarding_step="AWAITING_PRUNING_DATE")
-            
-            await send_text(sender, s["pruning_prompt"])
-            return
-
-        # Step 4: Pruning date
-        if step == "AWAITING_PRUNING_DATE":
-            if msg_type == "text" and validate_pruning_date(text_content):
-                await db.save_or_update_farmer(sender, pruning_date=text_content.strip(), onboarding_complete=1, onboarding_step="COMPLETED")
-                await send_text(sender, s["setup_done"])
-            else:
-                await send_text(sender, s["invalid_date"])
-            return
-
-    # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
-    history = await db.get_recent_history(sender, limit=2)
-    user_log = ""
-    bot_reply = ""
-
-    if msg_type == "text":
-        user_log = text_content
-        bot_reply = await query_gemini_fast(farmer, history, text_content)
-
-    elif msg_type == "audio":
-        media_id = raw_data.get("audio", {}).get("id")
-        audio_bytes, mime = await download_media(media_id)
-        user_log = "[Audio Note]"
-        bot_reply = await query_gemini_fast(farmer, history, audio_bytes, mime_type=mime)
-
-    else:
-        await send_text(sender, "कृपया प्रश्न मजकूर (text) किंवा व्हॉइस नोट (audio) द्वारे पाठवा.")
-        return
-
-    await send_text(sender, bot_reply)
-    await db.save_chat_turn(sender, "user", user_log)
-    await db.save_chat_turn(sender, "model", bot_reply)
+        await send_text(sender, bot_reply)
+        await db.save_chat_turn(sender, "user", user_log)
+        await db.save_chat_turn(sender, "model", bot_reply)
 
 # --- Webhook Endpoints ---
 @app.get("/webhook")
@@ -277,6 +342,19 @@ async def receive(request: Request, bg: BackgroundTasks):
         messages = data.get("entry", [])[0].get("changes", [])[0].get("value", {}).get("messages", [])
         if messages:
             msg = messages[0]
+            msg_id = msg.get("id")
+            now = time.time()
+            if msg_id:
+                # Evict expired message IDs to bound memory
+                if len(processed_msg_ids) > 1000:
+                    cutoff = now - MSG_ID_TTL
+                    expired = [mid for mid, ts in processed_msg_ids.items() if ts < cutoff]
+                    for mid in expired:
+                        del processed_msg_ids[mid]
+                if msg_id in processed_msg_ids:
+                    return {"status": "ignored_duplicate"}
+                processed_msg_ids[msg_id] = now
+
             bg.add_task(dispatch_message, msg.get("from"), msg.get("type"), msg)
     except Exception as e:
         print("Webhook error:", e)
