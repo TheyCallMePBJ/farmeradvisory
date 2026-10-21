@@ -13,6 +13,11 @@ from fastapi import FastAPI, Request, Response, BackgroundTasks, Query
 from google import genai
 from google.genai import types
 
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
 import database as db
 
 load_dotenv()
@@ -180,6 +185,61 @@ async def mark_as_read(msg_id: str):
         "messaging_product": "whatsapp",
         "status": "read",
         "message_id": msg_id
+    })
+
+# --- Text-to-Speech (TTS) Voice Helpers (Edge TTS) ---
+TTS_VOICES = {
+    "mr": "mr-IN-AarohiNeural",  # Natural Marathi Female Neural Voice
+    "hi": "hi-IN-SwaraNeural",   # Natural Hindi Female Neural Voice
+    "en": "en-IN-NeerjaNeural",  # Natural Indian English Female Neural Voice
+}
+
+async def generate_speech_audio(text: str, lang: str = "mr") -> bytes | None:
+    if edge_tts is None:
+        logger.warning("edge_tts package is not available; skipping audio generation")
+        return None
+    try:
+        voice = TTS_VOICES.get(lang, TTS_VOICES["mr"])
+        # Clean formatting, bold asterisks, and bullet emojis so speech flows naturally
+        clean_text = re.sub(r'[*_#~`]', '', text)
+        clean_text = re.sub(r'[🍇✅⚠️📅•\-]', '', clean_text)
+        clean_text = re.sub(r'[ \t]+', ' ', clean_text).strip()
+        communicate = edge_tts.Communicate(clean_text, voice)
+        audio_buffer = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_buffer.extend(chunk["data"])
+        return bytes(audio_buffer)
+    except Exception as e:
+        logger.exception(f"[TTS Generation Error]: {e}")
+        return None
+
+async def upload_whatsapp_media(file_bytes: bytes, mime_type: str = "audio/mpeg") -> str | None:
+    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        return None
+    client = await get_http_client()
+    url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/media"
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    files = {"file": ("advisory.mp3", file_bytes, mime_type)}
+    data = {"messaging_product": "whatsapp", "type": mime_type}
+    try:
+        r = await client.post(url, headers=headers, files=files, data=data, timeout=15.0)
+        if r.status_code == 200:
+            media_id = r.json().get("id")
+            logger.info(f"[Meta Media Upload Success]: Uploaded audio media ID: {media_id}")
+            return media_id
+        else:
+            logger.error(f"[Meta Media Upload Error {r.status_code}]: {r.text}")
+    except Exception as e:
+        logger.exception(f"[Meta Media Upload Exception]: {e}")
+    return None
+
+async def send_audio(to: str, media_id: str):
+    await send_whatsapp({
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "audio",
+        "audio": {"id": media_id}
     })
 
 # --- Weather API Helper ---
@@ -527,6 +587,20 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                 return
 
             await send_text(sender, bot_reply)
+
+            # If user sent a voice note, respond with both text and voice note
+            if msg_type == "audio" and not bot_reply.startswith("क्षमस्व") and not bot_reply.startswith("क्षमा") and not bot_reply.startswith("Sorry"):
+                try:
+                    farmer_lang = farmer.get("language", "mr")
+                    logger.info(f"Synthesizing voice response using Edge TTS in '{farmer_lang}'")
+                    audio_reply_bytes = await generate_speech_audio(bot_reply, lang=farmer_lang)
+                    if audio_reply_bytes:
+                        uploaded_id = await upload_whatsapp_media(audio_reply_bytes, mime_type="audio/mpeg")
+                        if uploaded_id:
+                            await send_audio(sender, uploaded_id)
+                except Exception as e:
+                    logger.exception(f"Error generating/sending TTS voice response: {e}")
+
             # Only save successful exchanges to history (never corrupt history with error messages)
             if not bot_reply.startswith("क्षमस्व") and not bot_reply.startswith("क्षमा") and not bot_reply.startswith("Sorry"):
                 await db.save_chat_exchange(sender, user_log, bot_reply)
