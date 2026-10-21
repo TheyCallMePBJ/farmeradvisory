@@ -433,38 +433,45 @@ STRICT INSTRUCTIONS:
     )
 
     # Dynamic model fallback chain:
-    # If primary hits 429 quota or times out, immediately fall back to other models with separate quota buckets.
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # Supports current 3.x Flash-Lite generation as well as legacy fallbacks
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     candidate_models = [primary_model]
-    for alt in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+    for alt in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
         if alt not in candidate_models:
             candidate_models.append(alt)
 
     for model_name in candidate_models:
-        try:
-            res = await asyncio.wait_for(
-                ai_client.aio.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config,
-                ),
-                timeout=7.0  # Snappy 7-second timeout before trying next candidate
-            )
+        for current_config in [config, types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2, max_output_tokens=max_tokens)]:
+            try:
+                res = await asyncio.wait_for(
+                    ai_client.aio.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=current_config,
+                    ),
+                    timeout=7.0  # Snappy 7-second timeout before trying next candidate
+                )
 
-            reply_text = ""
-            if res.text:
-                reply_text = res.text.strip()
-            elif res.candidates and res.candidates[0].content and res.candidates[0].content.parts:
-                reply_text = "".join(p.text for p in res.candidates[0].content.parts if getattr(p, "text", None)).strip()
+                reply_text = ""
+                if res.text:
+                    reply_text = res.text.strip()
+                elif res.candidates and res.candidates[0].content and res.candidates[0].content.parts:
+                    reply_text = "".join(p.text for p in res.candidates[0].content.parts if getattr(p, "text", None)).strip()
 
-            if reply_text:
-                cleaned = clean_language_output(reply_text, target_lang)
-                return cleaned
+                if reply_text:
+                    cleaned = clean_language_output(reply_text, target_lang)
+                    return cleaned
 
-        except asyncio.TimeoutError:
-            logger.warning(f"[Gemini Timeout] Model '{model_name}' timed out after 7s. Trying fallback model...")
-        except Exception as e:
-            logger.warning(f"[Gemini Error] Model '{model_name}' failed ({type(e).__name__}: {e}). Trying fallback model...")
+            except asyncio.TimeoutError:
+                logger.warning(f"[Gemini Timeout] Model '{model_name}' timed out after 7s. Trying fallback model...")
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                if "thinking" in err_str and current_config == config:
+                    # Retry this same model without thinking_config if rejected
+                    continue
+                logger.warning(f"[Gemini Error] Model '{model_name}' failed ({type(e).__name__}: {e}). Trying fallback model...")
+                break
 
     # Fallback message matching target language
     if target_lang == "hi":
