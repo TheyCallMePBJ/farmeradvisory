@@ -59,6 +59,14 @@ async def save_chat_turn(phone: str, role: str, content: str):
         )
         await db.commit()
 
+async def save_chat_exchange(phone: str, user_content: str, model_content: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO chat_history (phone_number, role, content) VALUES (?, 'user', ?), (?, 'model', ?)",
+            (phone, user_content, phone, model_content)
+        )
+        await db.commit()
+
 async def get_recent_history(phone: str, limit: int = 4) -> list[dict]:
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row

@@ -40,8 +40,23 @@ user_locks = defaultdict(asyncio.Lock)
 processed_msg_ids: dict[str, float] = {}
 MSG_ID_TTL = 300  # 5 minutes
 
+# Track last query text and timestamp per sender for rapid repeated message deduplication
+last_user_queries: dict[str, tuple[str, float]] = {}
+
 weather_cache: dict[str, dict] = {}
 WEATHER_CACHE_TTL = 1800  # 30 minutes
+
+# Shared persistent HTTP client for connection pooling and lower latency
+http_client: httpx.AsyncClient | None = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global http_client
+    if http_client is None or http_client.is_closed:
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
+    return http_client
 
 # --- Multilingual UI Strings Dictionary ---
 STRINGS = {
@@ -82,12 +97,19 @@ STRINGS = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_client
     logger.info("Starting up Krishi Saathi WhatsApp Bot...")
     await db.init_db()
     logger.info(f"Database initialized: {db.DB_NAME}")
     logger.info(f"Configuration check: META_ACCESS_TOKEN={'SET' if META_ACCESS_TOKEN else 'MISSING'}, PHONE_NUMBER_ID={PHONE_NUMBER_ID or 'MISSING'}, VERIFY_TOKEN={'SET' if VERIFY_TOKEN else 'MISSING'}, GEMINI_API_KEY={'SET' if GEMINI_API_KEY else 'MISSING'}, OPENWEATHER_API_KEY={'SET' if OPENWEATHER_API_KEY else 'MISSING'}")
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(15.0, connect=5.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+    )
     yield
     logger.info("Shutting down Krishi Saathi...")
+    if http_client and not http_client.is_closed:
+        await http_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -111,15 +133,15 @@ async def send_whatsapp(payload: dict):
         return
 
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=12.0)
-            if r.status_code >= 400:
-                logger.error(f"[Meta Outbound Error {r.status_code}]: {r.text}")
-            else:
-                logger.info("[Meta Outbound Success]: WhatsApp message sent successfully")
-        except Exception as e:
-            logger.exception(f"[Meta Outbound Exception]: {e}")
+    client = await get_http_client()
+    try:
+        r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=10.0)
+        if r.status_code >= 400:
+            logger.error(f"[Meta Outbound Error {r.status_code}]: {r.text}")
+        else:
+            logger.info("[Meta Outbound Success]: WhatsApp message sent successfully")
+    except Exception as e:
+        logger.exception(f"[Meta Outbound Exception]: {e}")
 
 async def send_text(to: str, text: str):
     await send_whatsapp({"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}})
@@ -145,11 +167,11 @@ async def send_list(to: str, body: str, btn_text: str, items: list):
 
 async def download_media(media_id: str) -> tuple[bytes, str]:
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"https://graph.facebook.com/v21.0/{media_id}", headers=headers, timeout=10.0)
-        data = r.json()
-        audio_stream = await client.get(data.get("url"), headers=headers, timeout=20.0)
-        return audio_stream.content, data.get("mime_type", "audio/ogg").split(";")[0]
+    client = await get_http_client()
+    r = await client.get(f"https://graph.facebook.com/v21.0/{media_id}", headers=headers, timeout=10.0)
+    data = r.json()
+    audio_stream = await client.get(data.get("url"), headers=headers, timeout=20.0)
+    return audio_stream.content, data.get("mime_type", "audio/ogg").split(";")[0]
 
 # --- Weather API Helper ---
 async def get_district_weather(district: str) -> dict | None:
@@ -168,62 +190,133 @@ async def get_district_weather(district: str) -> dict | None:
         "units": "metric"
     }
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, params=params, timeout=5.0)
-            if r.status_code == 200:
-                data = r.json()
-                weather_info = {
-                    "temp": round(data.get("main", {}).get("temp", 0), 1),
-                    "humidity": data.get("main", {}).get("humidity", 0),
-                    "condition": data.get("weather", [{}])[0].get("description", "Clear"),
-                    "rain_1h": data.get("rain", {}).get("1h", 0),
-                    "wind_speed": round(data.get("wind", {}).get("speed", 0) * 3.6, 1),
-                }
-                weather_cache[district] = {"timestamp": now, "data": weather_info}
-                return weather_info
-            else:
-                print(f"[OpenWeather Error] {r.status_code}: {r.text}")
+        client = await get_http_client()
+        r = await client.get(url, params=params, timeout=4.0)
+        if r.status_code == 200:
+            data = r.json()
+            weather_info = {
+                "temp": round(data.get("main", {}).get("temp", 0), 1),
+                "humidity": data.get("main", {}).get("humidity", 0),
+                "condition": data.get("weather", [{}])[0].get("description", "Clear"),
+                "rain_1h": data.get("rain", {}).get("1h", 0),
+                "wind_speed": round(data.get("wind", {}).get("speed", 0) * 3.6, 1),
+            }
+            weather_cache[district] = {"timestamp": now, "data": weather_info}
+            return weather_info
+        else:
+            logger.error(f"[OpenWeather Error] {r.status_code}: {r.text}")
     except Exception as e:
-        print(f"[OpenWeather Exception]: {e}")
+        logger.exception(f"[OpenWeather Exception]: {e}")
 
     return cached["data"] if cached else None
 
-# --- Gemini Query Handler (Fast & Direct) ---
+# --- Language Helpers ---
+def detect_query_language(text: str, default_lang: str = "mr") -> str:
+    if not text or not text.strip():
+        return default_lang
+    devanagari_chars = len(re.findall(r'[\u0900-\u097F]', text))
+    total_chars = len(re.findall(r'\w', text))
+    if total_chars > 0 and (devanagari_chars / total_chars) > 0.25:
+        # Check for typical Marathi markers or fallback to default_lang
+        marathi_markers = ["आहे", "का", "काय", "करावी", "रोगाचा", "पावसामुळे", "झाले", "नाही", "शकत", "बागेत", "कसे", "द्राक्ष", "करावे", "होते", "ळ"]
+        if any(marker in text for marker in marathi_markers) or default_lang == "mr":
+            return "mr"
+        return "hi"
+    latin_chars = len(re.findall(r'[A-Za-z]', text))
+    if total_chars > 0 and (latin_chars / total_chars) > 0.5:
+        return "en"
+    return default_lang
+
+def clean_language_output(text: str, target_lang: str) -> str:
+    if target_lang in ["mr", "hi"]:
+        # Strip common English parenthetical translations or Latin abbreviations that LLMs inject
+        text = re.sub(r'\s*\(\s*(?:Downy|Powdery)\s+Mildew\s*\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(\s*(?:WDG|SC|EC|WP)\s*\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*\(\s*(?:gm|g|ml|l|acre)\s*\)', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+# --- Gemini Query Handler (Fast, Robust & Language-Pure) ---
 async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str | bytes, mime_type: str = "text/plain") -> str:
     district = farmer.get("district", "Nashik")
-    weather = await get_district_weather(district)
+    default_lang = farmer.get("language", "mr")
 
+    if isinstance(user_input, str):
+        target_lang = detect_query_language(user_input, default_lang=default_lang)
+    else:
+        target_lang = default_lang
+
+    weather = await get_district_weather(district)
     if weather:
         weather_text = (
-            f"- Live Weather in {district}: Temp {weather['temp']}°C, "
-            f"Humidity {weather['humidity']}%, Condition: '{weather['condition']}', "
-            f"Rain (last 1h): {weather['rain_1h']}mm, Wind: {weather['wind_speed']} km/h"
+            f"- Current Weather in {district}: Temp {weather['temp']}°C, "
+            f"Relative Humidity {weather['humidity']}%, Sky: '{weather['condition']}', "
+            f"Rainfall (last 1h): {weather['rain_1h']}mm, Wind: {weather['wind_speed']} km/h"
         )
     else:
         weather_text = f"- District: {district} (Live weather unavailable)"
 
-    system_instruction = f"""
-You are 'Krishi Saathi' (कृषी साथी), a specialist agricultural advisor for grape farmers in Maharashtra, India.
+    if target_lang == "mr":
+        lang_rule = """CRITICAL LANGUAGE MANDATE:
+- You must respond 100% EXCLUSIVELY in pure Marathi (मराठी) using Devanagari script.
+- STRICTLY FORBIDDEN: Do NOT include ANY English words, Latin script letters, or English translations in parentheses or brackets anywhere.
+- Write ONLY 'केवडा' (NEVER 'केवडा (Downy Mildew)').
+- Write ONLY 'भुरी' (NEVER 'भुरी (Powdery Mildew)').
+- Write all chemical formulations, dosages, and units in Devanagari script or pure Marathi words (उदा. '८०% डब्ल्यूडीजी' किंवा '८०% विद्राव्य पावडर', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). NEVER write Latin abbreviations like 'WDG', 'SC', 'EC', 'ml' in brackets.
+- The entire response must read naturally and completely in Marathi."""
+    elif target_lang == "hi":
+        lang_rule = """CRITICAL LANGUAGE MANDATE:
+- You must respond 100% EXCLUSIVELY in pure Hindi (हिंदी) using Devanagari script.
+- STRICTLY FORBIDDEN: Do NOT include ANY English words, Latin script letters, or English translations in parentheses or brackets anywhere.
+- Write technical terms, disease names, formulations, and units in Devanagari script (उदा. '८०% डब्लूडीजी', '५% एससी', 'मिली', 'ग्राम', 'प्रति २०० लीटर पानी').
+- The entire response must read naturally and completely in Hindi."""
+    else:
+        lang_rule = """CRITICAL LANGUAGE MANDATE:
+- You must respond 100% in English."""
+
+    system_instruction = f"""You are 'Krishi Saathi' (कृषी साथी), an expert agricultural viticulture advisor for grape farmers in Maharashtra, India.
 Farmer Details:
 - District: {district}
 {weather_text}
 - Grape Variety: {farmer.get('variety', 'Thompson Seedless')}
-- Pruning Date: {farmer.get('pruning_date', 'Not specified')}
+- Fruit Pruning Date: {farmer.get('pruning_date', 'Not specified')}
 
-Strict Rules:
-1. Always respond in the EXACT same language the user asks in (Marathi, Hindi, or English).
-2. Use single asterisks for *bold*. Never use '#', '##', or tables.
-3. Keep the reply direct, concise, and actionable (under 75 words, maximum 3-4 bullet points).
-4. When advising on spraying, always give exact chemical or organic doses per 200L water tank or per acre.
-5. Use the live weather context (humidity, rain, temp, wind) to assess disease risks (like Downy Mildew / केवडा if humidity >80% or rain, Powdery Mildew / भुरी if moderate temp and morning humidity) and spraying suitability (e.g. avoid spraying if wind >15 km/h or rain is imminent).
+{lang_rule}
+
+Strict Formatting & Content Rules:
+1. Use single asterisks for *bold*. Never use '#', '##', or tables.
+2. Keep the reply direct, concise, and actionable (maximum 60-80 words, 3 to 4 short bullet points).
+3. When advising on spraying, always give exact chemical or organic doses per 200L water tank or per acre.
+4. Disease Risk & Spraying Guide based on live weather:
+   - High humidity (>80%) or rain -> high risk of Downy Mildew (केवडा).
+   - Moderate temperature with humid morning canopy -> risk of Powdery Mildew (भुरी).
+   - If wind speed > 15 km/h or rain is imminent, explicitly advise postponing chemical spraying.
 """
+
     contents = []
-    # Include up to 2 prior turns only to keep prompt lean and fast
-    for turn in history[-2:]:
+    # Build clean alternating history (must start with user, must strictly alternate)
+    last_role = None
+    for turn in history[-4:]:
+        role = "user" if turn["role"] == "user" else "model"
+        content_text = turn.get("content", "").strip()
+        # Skip empty turns or error messages
+        if not content_text or content_text.startswith("क्षमस्व") or content_text.startswith("क्षमा") or content_text.startswith("Sorry"):
+            continue
+        # Gemini requires the first turn in contents to be 'user'
+        if not contents and role != "user":
+            continue
+        # Strict alternation required
+        if role == last_role:
+            continue
         contents.append(types.Content(
-            role="user" if turn["role"] == "user" else "model",
-            parts=[types.Part.from_text(text=turn["content"])]
+            role=role,
+            parts=[types.Part.from_text(text=content_text)]
         ))
+        last_role = role
+
+    # Ensure the last history turn is 'model' so the new user turn follows properly
+    if contents and contents[-1].role == "user":
+        contents.pop()
 
     if isinstance(user_input, bytes):
         contents.append(types.Content(
@@ -239,22 +332,47 @@ Strict Rules:
             parts=[types.Part.from_text(text=user_input)]
         ))
 
-    try:
-        # Zero thinking budget avoids internal scratchpad delays
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2,
-            max_output_tokens=300,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        )
-        res = await ai_client.aio.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=contents,
-            config=config,
-        )
-        return res.text.strip()
-    except Exception as e:
-        print(f"[Gemini Error]: {e}")
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.2,
+        max_output_tokens=700,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
+
+    for attempt in range(2):
+        try:
+            res = await asyncio.wait_for(
+                ai_client.aio.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=contents,
+                    config=config,
+                ),
+                timeout=12.0
+            )
+
+            reply_text = ""
+            if res.text:
+                reply_text = res.text.strip()
+            elif res.candidates and res.candidates[0].content and res.candidates[0].content.parts:
+                reply_text = "".join(p.text for p in res.candidates[0].content.parts if getattr(p, "text", None)).strip()
+
+            if reply_text:
+                cleaned = clean_language_output(reply_text, target_lang)
+                return cleaned
+
+        except asyncio.TimeoutError:
+            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1} timed out after 12s")
+        except Exception as e:
+            logger.exception(f"[Gemini Exception] Attempt {attempt + 1}: {e}")
+            if attempt == 0:
+                await asyncio.sleep(1.0)
+
+    # Fallback message matching target language
+    if target_lang == "hi":
+        return "क्षमा करें, उत्तर प्राप्त करने में समस्या आ रही है। कृपया कुछ समय बाद पुनः प्रयास करें।"
+    elif target_lang == "en":
+        return "Sorry, having trouble generating an advisory right now. Please try again in a moment."
+    else:
         return "क्षमस्व, उत्तर मिळवण्यात अडचण येत आहे. कृपया थोड्या वेळाने प्रयत्न करा."
 
 # --- State Machine & Onboarding Flow ---
@@ -286,6 +404,16 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
 
             # 1. First-time user or manual reset
             text_content = raw_data.get("text", {}).get("body", "").strip() if msg_type == "text" else ""
+
+            # Deduplicate rapid repeated text queries within 3 seconds
+            now = time.time()
+            last_text, last_ts = last_user_queries.get(sender, ("", 0.0))
+            if msg_type == "text" and text_content and text_content == last_text and (now - last_ts < 3.0):
+                logger.info(f"Ignoring duplicate rapid message from {sender}")
+                return
+            if msg_type == "text" and text_content:
+                last_user_queries[sender] = (text_content, now)
+
             if not farmer or text_content.lower() in ["reset", "restart", "start"]:
                 logger.info("Starting onboarding / language selection")
                 await start_language_selection(sender)
@@ -339,7 +467,7 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                     return
 
             # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
-            history = await db.get_recent_history(sender, limit=2)
+            history = await db.get_recent_history(sender, limit=4)
             user_log = ""
             bot_reply = ""
 
@@ -360,8 +488,9 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                 return
 
             await send_text(sender, bot_reply)
-            await db.save_chat_turn(sender, "user", user_log)
-            await db.save_chat_turn(sender, "model", bot_reply)
+            # Only save successful exchanges to history (never corrupt history with error messages)
+            if not bot_reply.startswith("क्षमस्व") and not bot_reply.startswith("क्षमा") and not bot_reply.startswith("Sorry"):
+                await db.save_chat_exchange(sender, user_log, bot_reply)
 
         except Exception as e:
             logger.exception(f"Unhandled error in dispatch_message: {e}")
