@@ -297,7 +297,7 @@ def detect_query_language(text: str, default_lang: str = "mr") -> str:
     return default_lang
 
 def clean_language_output(text: str, target_lang: str) -> str:
-    # Strip accidental greeting prefixes (e.g. "Namaste, Krishi Mitra!", "Namaste Krishi Mitra!", "नमस्कार!")
+    # 1. Strip accidental greeting prefixes (e.g. "Namaste, Krishi Mitra!", "Namaste Krishi Mitra!", "नमस्कार!")
     greeting_patterns = [
         r'^(?:Namaste|Namaskar|Hello|Greetings)[,\s]*(?:Krishi\s+Mitra|Farmer|Kisan)?[!.\s\-:]*',
         r'^(?:नमस्कार|नमस्ते|राम\s*राम)[,\s]*(?:शेतकरी\s*मित्र|कृषी\s*मित्र|किसान\s*मित्र|मित्रा)?[!.\s\-:]*',
@@ -305,12 +305,17 @@ def clean_language_output(text: str, target_lang: str) -> str:
     for pat in greeting_patterns:
         text = re.sub(pat, '', text, flags=re.IGNORECASE).lstrip()
 
-    if target_lang in ["mr", "hi"]:
-        # Strip common English parenthetical translations or Latin abbreviations that LLMs inject
+    # 2. Strict language purity (no mixing languages in parentheses)
+    if target_lang == "en":
+        # In English responses, strip any accidental Devanagari script (e.g. "(केवडा)", "(भुरी)")
+        text = re.sub(r'\s*\(\s*[\u0900-\u097F\s/]+\s*\)', '', text)
+    elif target_lang in ["mr", "hi"]:
+        # In Marathi/Hindi responses, strip any accidental English translations or Latin abbreviations
         text = re.sub(r'\s*\(\s*(?:Downy|Powdery)\s+Mildew\s*\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s*\(\s*(?:WDG|SC|EC|WP)\s*\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'\s*\(\s*(?:gm|g|ml|l|acre)\s*\)', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\s*\(\s*[a-zA-Z\s/,-]+\s*\)', '', text)
+        text = re.sub(r'\s*\(\s*[^)]*(?:WDG|SC|EC|WP|ml|gm|acre)[^)]*\)', '', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'[ \t]+', ' ', text)
     return text.strip()
 
 # --- Gemini Query Handler (Fast, Robust & Language-Pure) ---
@@ -334,20 +339,27 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
         weather_text = f"- District: {district} (Live weather unavailable)"
 
     if target_lang == "mr":
-        lang_rule = """भाषा नियम (अत्यंत महत्त्वाचे):
-- १००% शुद्ध मराठी भाषेत आणि देवनागरी लिपीत उत्तर द्या.
-- कोणत्याही इंग्रजी शब्दांचा किंवा लॅटिन अक्षरांचा वापर पूर्णपणे वर्ज्य आहे.
-- कंसात इंग्रजी भाषांतर कधीही लिहू नका (उदा. 'केवडा (Downy Mildew)' किंवा 'भुरी (Powdery Mildew)' असे लिहू नका; फक्त '*केवडा*' आणि '*भुरी*' असेच लिहा).
-- औषधांची नावे, प्रमाण आणि स्वरूप मराठीत लिहा (उदा. '८०% विद्राव्य गंधक भुकटी', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). 'WDG', 'SC', 'ml' अशी इंग्रजी अक्षरे वापरू नका."""
+        disease_names = "केवडा आणि भुरी"
+        lang_rule = """भाषा नियम (अत्यंत महत्त्वाचे - १००% शुद्ध मराठी):
+- संपूर्ण उत्तर १००% शुद्ध मराठी भाषेत आणि देवनागरी लिपीतच लिहा.
+- कोणतेही इंग्रजी शब्द किंवा लॅटिन अक्षरे वापरणे पूर्णपणे वर्ज्य आहे.
+- कंसात इंग्रजी भाषांतर कधीही लिहू नका (उदा. 'केवडा (Downy Mildew)' किंवा 'भुरी (Powdery Mildew)' असे अजिबात लिहू नका; फक्त '*केवडा*' आणि '*भुरी*' असेच लिहा).
+- औषधांची नावे, प्रमाण आणि स्वरूप मराठीत लिहा (उदा. '८०% विद्राव्य गंधक भुकटी', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). 'WDG', 'SC', 'ml', 'gm' अशी इंग्रजी अक्षरे वापरू नका."""
     elif target_lang == "hi":
-        lang_rule = """भाषा नियम (अति महत्वपूर्ण):
-- १००% शुद्ध हिंदी भाषा और देवनागरी लिपि में उत्तर दें।
+        disease_names = "केवड़ा और भूरी"
+        lang_rule = """भाषा नियम (अति महत्वपूर्ण - १००% शुद्ध हिंदी):
+- संपूर्ण उत्तर १००% शुद्ध हिंदी भाषा और देवनागरी लिपि में ही लिखें।
 - अंग्रेजी शब्दों या लैटिन अक्षरों का प्रयोग पूर्णतः वर्जित है।
-- कोष्ठक में अंग्रेजी नाम न लिखें (उदा. केवल '*केवड़ा*' और '*भूरी*' लिखें)।
+- कोष्ठक में अंग्रेजी नाम न लिखें (उदा. केवल '*केवड़ा*' और '*भूरी*' लिखें; 'Downy Mildew' या 'Powdery Mildew' बिल्कुल न लिखें)।
 - दवाओं के नाम, मात्रा और इकाइयाँ हिंदी में लिखें (उदा. '८०% डब्लूडीजी', '५% एससी', 'मिली', 'ग्राम', 'प्रति २०० लीटर पानी')."""
     else:
-        lang_rule = """LANGUAGE RULE:
-- Respond 100% in clear English."""
+        disease_names = "Downy Mildew and Powdery Mildew"
+        lang_rule = """LANGUAGE PURITY MANDATE (100% PURE ENGLISH):
+- Your entire response MUST be 100% strictly in pure English.
+- ABSOLUTELY NEVER include Devanagari script, Marathi words, or Hindi words in parentheses or anywhere in the text.
+- Write ONLY 'Downy Mildew' (NEVER 'Downy Mildew (केवडा)').
+- Write ONLY 'Powdery Mildew' (NEVER 'Powdery Mildew (भुरी)').
+- Do NOT mix any Indian language words into English responses."""
 
     is_audio = isinstance(user_input, bytes)
     if is_audio:
@@ -371,7 +383,7 @@ STRICT INSTRUCTIONS:
 {length_rule}
 3. Formatting: Use single asterisks for *bold*. Never use '#', '##', or markdown tables.
 4. Spray Dosages: Always specify exact chemical or organic doses per 200L water tank or per acre.
-5. Weather Assessment: Evaluate Downy Mildew (केवडा) and Powdery Mildew (भुरी) risks using live weather, and advise postponing sprays if wind speed exceeds 15 km/h or rain is imminent.
+5. Weather Assessment: Evaluate {disease_names} risks using live weather, and advise postponing sprays if wind speed exceeds 15 km/h or rain is imminent.
 """
 
     contents = []
@@ -420,18 +432,23 @@ STRICT INSTRUCTIONS:
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    target_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    max_retries = 2
+    # Dynamic model fallback chain:
+    # If primary hits 429 quota or times out, immediately fall back to other models with separate quota buckets.
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    candidate_models = [primary_model]
+    for alt in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+        if alt not in candidate_models:
+            candidate_models.append(alt)
 
-    for attempt in range(max_retries):
+    for model_name in candidate_models:
         try:
             res = await asyncio.wait_for(
                 ai_client.aio.models.generate_content(
-                    model=target_model,
+                    model=model_name,
                     contents=contents,
                     config=config,
                 ),
-                timeout=9.0
+                timeout=7.0  # Snappy 7-second timeout before trying next candidate
             )
 
             reply_text = ""
@@ -445,21 +462,9 @@ STRICT INSTRUCTIONS:
                 return cleaned
 
         except asyncio.TimeoutError:
-            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1}/{max_retries} timed out after 9s.")
+            logger.warning(f"[Gemini Timeout] Model '{model_name}' timed out after 7s. Trying fallback model...")
         except Exception as e:
-            err_msg = str(e).lower()
-            if "429" in err_msg or "resource_exhausted" in err_msg:
-                logger.warning(f"[Gemini 429 Quota Exceeded]: {e}")
-                # Don't aggressively loop-retry on 429 as it prolongs rate limiting
-                break
-            elif "503" in err_msg or "overloaded" in err_msg or "unavailable" in err_msg:
-                logger.warning(f"[Gemini 503 Overloaded] Attempt {attempt + 1}/{max_retries}. Backing off for 1.2s...")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(1.2)
-            else:
-                logger.exception(f"[Gemini Exception] Attempt {attempt + 1}/{max_retries}: {e}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(0.5)
+            logger.warning(f"[Gemini Error] Model '{model_name}' failed ({type(e).__name__}: {e}). Trying fallback model...")
 
     # Fallback message matching target language
     if target_lang == "hi":
