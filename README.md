@@ -14,7 +14,7 @@ Farmers can interact with the bot in Marathi, Hindi, or English using either tex
   - District selection (Nashik, Sangli, Pune)
   - Fruit pruning date registration (with calendar and range validation)
 - **Real-Time Weather Integration**: Connects to the OpenWeather API to fetch current temperature, humidity, rainfall, and wind speeds for the farmer's district. Live weather is used by the AI to evaluate disease risks like Downy Mildew (*केवडा*) and Powdery Mildew (*भुरी*), and advise on spraying suitability.
-- **Multimodal AI Advisory**: Farmers can send text queries or voice notes. Powered by Gemini 3.8 Flash with async processing, strictly matching the user's input language and providing exact dosages per 200L tank or acre.
+- **Multimodal AI Advisory**: Farmers can send text queries or voice notes. Powered by Gemini 2.5 Flash with async processing, strictly matching the user's input language and providing exact dosages per 200L tank or acre.
 - **Reliable Concurrency**: Built-in per-user asynchronous locks and message deduplication to handle rapid messaging and webhook retries safely.
 - **Health Check Endpoint**: Includes `/health` for easy service monitoring and cloud deployment readiness.
 
@@ -23,7 +23,7 @@ Farmers can interact with the bot in Marathi, Hindi, or English using either tex
 ## Tech Stack
 
 - **Backend**: FastAPI, Uvicorn
-- **AI Model**: Google Gemini (`google-genai` SDK, `gemini-3.8-flash`)
+- **AI Model**: Google Gemini (`google-genai` SDK, `gemini-2.5-flash`)
 - **Database**: SQLite via `aiosqlite`
 - **APIs**: Meta WhatsApp Cloud API (Graph API v21.0), OpenWeather API
 - **HTTP Client**: `httpx`

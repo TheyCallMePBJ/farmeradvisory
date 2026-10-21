@@ -237,6 +237,14 @@ def detect_query_language(text: str, default_lang: str = "mr") -> str:
     return default_lang
 
 def clean_language_output(text: str, target_lang: str) -> str:
+    # Strip accidental greeting prefixes (e.g. "Namaste, Krishi Mitra!", "Namaste Krishi Mitra!", "नमस्कार!")
+    greeting_patterns = [
+        r'^(?:Namaste|Namaskar|Hello|Greetings)[,\s]*(?:Krishi\s+Mitra|Farmer|Kisan)?[!.\s\-:]*',
+        r'^(?:नमस्कार|नमस्ते|राम\s*राम)[,\s]*(?:शेतकरी\s*मित्र|कृषी\s*मित्र|किसान\s*मित्र|मित्रा)?[!.\s\-:]*',
+    ]
+    for pat in greeting_patterns:
+        text = re.sub(pat, '', text, flags=re.IGNORECASE).lstrip()
+
     if target_lang in ["mr", "hi"]:
         # Strip common English parenthetical translations or Latin abbreviations that LLMs inject
         text = re.sub(r'\s*\(\s*(?:Downy|Powdery)\s+Mildew\s*\)', '', text, flags=re.IGNORECASE)
@@ -266,22 +274,20 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
         weather_text = f"- District: {district} (Live weather unavailable)"
 
     if target_lang == "mr":
-        lang_rule = """CRITICAL LANGUAGE MANDATE:
-- You must respond 100% EXCLUSIVELY in pure Marathi (मराठी) using Devanagari script.
-- STRICTLY FORBIDDEN: Do NOT include ANY English words, Latin script letters, or English translations in parentheses or brackets anywhere.
-- Write ONLY 'केवडा' (NEVER 'केवडा (Downy Mildew)').
-- Write ONLY 'भुरी' (NEVER 'भुरी (Powdery Mildew)').
-- Write all chemical formulations, dosages, and units in Devanagari script or pure Marathi words (उदा. '८०% डब्ल्यूडीजी' किंवा '८०% विद्राव्य पावडर', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). NEVER write Latin abbreviations like 'WDG', 'SC', 'EC', 'ml' in brackets.
-- The entire response must read naturally and completely in Marathi."""
+        lang_rule = """भाषा नियम (अत्यंत महत्त्वाचे):
+- १००% शुद्ध मराठी भाषेत आणि देवनागरी लिपीत उत्तर द्या.
+- कोणत्याही इंग्रजी शब्दांचा किंवा लॅटिन अक्षरांचा वापर पूर्णपणे वर्ज्य आहे.
+- कंसात इंग्रजी भाषांतर कधीही लिहू नका (उदा. 'केवडा (Downy Mildew)' किंवा 'भुरी (Powdery Mildew)' असे लिहू नका; फक्त '*केवडा*' आणि '*भुरी*' असेच लिहा).
+- औषधांची नावे, प्रमाण आणि स्वरूप मराठीत लिहा (उदा. '८०% विद्राव्य गंधक भुकटी', '५% एससी', 'मिली', 'ग्रॅम', 'प्रति २०० लिटर पाणी'). 'WDG', 'SC', 'ml' अशी इंग्रजी अक्षरे वापरू नका."""
     elif target_lang == "hi":
-        lang_rule = """CRITICAL LANGUAGE MANDATE:
-- You must respond 100% EXCLUSIVELY in pure Hindi (हिंदी) using Devanagari script.
-- STRICTLY FORBIDDEN: Do NOT include ANY English words, Latin script letters, or English translations in parentheses or brackets anywhere.
-- Write technical terms, disease names, formulations, and units in Devanagari script (उदा. '८०% डब्लूडीजी', '५% एससी', 'मिली', 'ग्राम', 'प्रति २०० लीटर पानी').
-- The entire response must read naturally and completely in Hindi."""
+        lang_rule = """भाषा नियम (अति महत्वपूर्ण):
+- १००% शुद्ध हिंदी भाषा और देवनागरी लिपि में उत्तर दें।
+- अंग्रेजी शब्दों या लैटिन अक्षरों का प्रयोग पूर्णतः वर्जित है।
+- कोष्ठक में अंग्रेजी नाम न लिखें (उदा. केवल '*केवड़ा*' और '*भूरी*' लिखें)।
+- दवाओं के नाम, मात्रा और इकाइयाँ हिंदी में लिखें (उदा. '८०% डब्लूडीजी', '५% एससी', 'मिली', 'ग्राम', 'प्रति २०० लीटर पानी')."""
     else:
-        lang_rule = """CRITICAL LANGUAGE MANDATE:
-- You must respond 100% in English."""
+        lang_rule = """LANGUAGE RULE:
+- Respond 100% in clear English."""
 
     system_instruction = f"""You are 'Krishi Saathi' (कृषी साथी), an expert agricultural viticulture advisor for grape farmers in Maharashtra, India.
 Farmer Details:
@@ -292,20 +298,18 @@ Farmer Details:
 
 {lang_rule}
 
-Strict Formatting & Content Rules:
-1. Use single asterisks for *bold*. Never use '#', '##', or tables.
-2. Keep the reply direct, concise, and actionable (maximum 60-80 words, 3 to 4 short bullet points).
-3. When advising on spraying, always give exact chemical or organic doses per 200L water tank or per acre.
-4. Disease Risk & Spraying Guide based on live weather:
-   - High humidity (>80%) or rain -> high risk of Downy Mildew (केवडा).
-   - Moderate temperature with humid morning canopy -> risk of Powdery Mildew (भुरी).
-   - If wind speed > 15 km/h or rain is imminent, explicitly advise postponing chemical spraying.
+STRICT INSTRUCTIONS:
+1. ABSOLUTELY NO GREETINGS: Do NOT begin with greetings, salutations, or pleasantries (NEVER say 'Namaste', 'नमस्कार', 'राम राम', 'Krishi Mitra', 'Hello', etc.). Do NOT introduce yourself or address the user as 'Krishi Mitra'. Begin directly with the answer/advice on the very first word.
+2. Direct & Actionable: Keep the reply concise and practical (maximum 60-80 words, 3 to 4 short bullet points).
+3. Formatting: Use single asterisks for *bold*. Never use '#', '##', or markdown tables.
+4. Spray Dosages: Always specify exact chemical or organic doses per 200L water tank or per acre.
+5. Weather Assessment: Evaluate Downy Mildew (केवडा) and Powdery Mildew (भुरी) risks using live weather, and advise postponing sprays if wind speed exceeds 15 km/h or rain is imminent.
 """
 
     contents = []
     # Build clean alternating history (must start with user, must strictly alternate)
     last_role = None
-    for turn in history[-4:]:
+    for turn in history[-2:]:
         role = "user" if turn["role"] == "user" else "model"
         content_text = turn.get("content", "").strip()
         # Skip empty turns or error messages
@@ -332,7 +336,7 @@ Strict Formatting & Content Rules:
             role="user",
             parts=[
                 types.Part.from_bytes(data=user_input, mime_type=mime_type),
-                types.Part.from_text(text="Concise advice for farmer:")
+                types.Part.from_text(text="Direct agricultural advice without greetings:")
             ]
         ))
     else:
@@ -348,8 +352,8 @@ Strict Formatting & Content Rules:
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    target_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-    max_retries = 3
+    target_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    max_retries = 2
 
     for attempt in range(max_retries):
         try:
@@ -359,7 +363,7 @@ Strict Formatting & Content Rules:
                     contents=contents,
                     config=config,
                 ),
-                timeout=8.0  # Snappy 8-second timeout per attempt
+                timeout=9.0
             )
 
             reply_text = ""
@@ -373,28 +377,25 @@ Strict Formatting & Content Rules:
                 return cleaned
 
         except asyncio.TimeoutError:
-            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1}/{max_retries} timed out after 8s.")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(0.5)
+            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1}/{max_retries} timed out after 9s.")
         except Exception as e:
             err_msg = str(e).lower()
-            # 503 Service Unavailable / Model Overloaded: wait briefly and retry
-            if "503" in err_msg or "overloaded" in err_msg or "unavailable" in err_msg:
-                wait_time = 0.8 * (2 ** attempt)  # 0.8s, 1.6s
-                logger.warning(f"[Gemini 503 Overloaded] Attempt {attempt + 1}/{max_retries}. Backing off for {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-            elif "429" in err_msg or "resource_exhausted" in err_msg:
-                wait_time = 1.2 * (2 ** attempt)  # 1.2s, 2.4s
-                logger.warning(f"[Gemini 429 Rate Limit] Attempt {attempt + 1}/{max_retries}. Backing off for {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
+            if "429" in err_msg or "resource_exhausted" in err_msg:
+                logger.warning(f"[Gemini 429 Quota Exceeded]: {e}")
+                # Don't aggressively loop-retry on 429 as it prolongs rate limiting
+                break
+            elif "503" in err_msg or "overloaded" in err_msg or "unavailable" in err_msg:
+                logger.warning(f"[Gemini 503 Overloaded] Attempt {attempt + 1}/{max_retries}. Backing off for 1.2s...")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1.2)
             else:
-                logger.exception(f"[Gemini Unexpected Error] Attempt {attempt + 1}/{max_retries}: {e}")
+                logger.exception(f"[Gemini Exception] Attempt {attempt + 1}/{max_retries}: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(0.5)
 
     # Fallback message matching target language
     if target_lang == "hi":
-        return "क्षमा करें, उत्तर प्राप्त करने में समस्या आ रही है। कृपया कुछ समय बाद पुनः प्रयास करें।"
+        return "क्षमा करें, उत्तर प्राप्त करने में समस्या आ रही है। कृपया कुछ क्षण बाद पुनः प्रयास करें।"
     elif target_lang == "en":
         return "Sorry, having trouble generating an advisory right now. Please try again in a moment."
     else:
