@@ -349,6 +349,14 @@ async def query_gemini_fast(farmer: dict, history: list[dict], user_input: str |
         lang_rule = """LANGUAGE RULE:
 - Respond 100% in clear English."""
 
+    is_audio = isinstance(user_input, bytes)
+    if is_audio:
+        length_rule = "2. Ultra-Concise Voice Mode: Provide an ultra-short, direct response under 35-45 words (maximum 1-2 punchy sentences with exact spray dose per 200L tank or acre). Do not provide lengthy explanations."
+        max_tokens = 220
+    else:
+        length_rule = "2. Direct & Actionable: Keep the reply concise and practical (maximum 60-75 words, 3 to 4 short bullet points)."
+        max_tokens = 450
+
     system_instruction = f"""You are 'Krishi Saathi' (कृषी साथी), an expert agricultural viticulture advisor for grape farmers in Maharashtra, India.
 Farmer Details:
 - District: {district}
@@ -360,7 +368,7 @@ Farmer Details:
 
 STRICT INSTRUCTIONS:
 1. ABSOLUTELY NO GREETINGS: Do NOT begin with greetings, salutations, or pleasantries (NEVER say 'Namaste', 'नमस्कार', 'राम राम', 'Krishi Mitra', 'Hello', etc.). Do NOT introduce yourself or address the user as 'Krishi Mitra'. Begin directly with the answer/advice on the very first word.
-2. Direct & Actionable: Keep the reply concise and practical (maximum 60-80 words, 3 to 4 short bullet points).
+{length_rule}
 3. Formatting: Use single asterisks for *bold*. Never use '#', '##', or markdown tables.
 4. Spray Dosages: Always specify exact chemical or organic doses per 200L water tank or per acre.
 5. Weather Assessment: Evaluate Downy Mildew (केवडा) and Powdery Mildew (भुरी) risks using live weather, and advise postponing sprays if wind speed exceeds 15 km/h or rain is imminent.
@@ -391,12 +399,12 @@ STRICT INSTRUCTIONS:
     if contents and contents[-1].role == "user":
         contents.pop()
 
-    if isinstance(user_input, bytes):
+    if is_audio:
         contents.append(types.Content(
             role="user",
             parts=[
                 types.Part.from_bytes(data=user_input, mime_type=mime_type),
-                types.Part.from_text(text="Direct agricultural advice without greetings:")
+                types.Part.from_text(text="Direct ultra-concise advice for farmer in under 40 words, no greetings:")
             ]
         ))
     else:
@@ -408,7 +416,7 @@ STRICT INSTRUCTIONS:
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.2,
-        max_output_tokens=450,
+        max_output_tokens=max_tokens,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
