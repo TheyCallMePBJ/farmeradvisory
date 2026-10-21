@@ -429,25 +429,24 @@ STRICT INSTRUCTIONS:
         system_instruction=system_instruction,
         temperature=0.2,
         max_output_tokens=max_tokens,
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
     # Dynamic model fallback chain:
-    # Supports current 3.x Flash-Lite generation as well as legacy fallbacks
+    # Uses verified available 3.x Flash-Lite models on the free tier
     primary_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
     candidate_models = [primary_model]
-    for alt in ["gemini-3.5-flash-lite", "gemini-3.8-flash"]:
+    for alt in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
         if alt not in candidate_models:
             candidate_models.append(alt)
 
     for model_name in candidate_models:
-        for current_config in [config, types.GenerateContentConfig(system_instruction=system_instruction, temperature=0.2, max_output_tokens=max_tokens)]:
+        for attempt in range(2):  # Handles transient 503 / overload with quick backoff
             try:
                 res = await asyncio.wait_for(
                     ai_client.aio.models.generate_content(
                         model=model_name,
                         contents=contents,
-                        config=current_config,
+                        config=config,
                     ),
                     timeout=7.0  # Snappy 7-second timeout before trying next candidate
                 )
@@ -467,8 +466,9 @@ STRICT INSTRUCTIONS:
                 break
             except Exception as e:
                 err_str = str(e).lower()
-                if "thinking" in err_str and current_config == config:
-                    # Retry this same model without thinking_config if rejected
+                if ("503" in err_str or "unavailable" in err_str or "overloaded" in err_str) and attempt == 0:
+                    logger.warning(f"[Gemini 503 Overloaded] Model '{model_name}' busy. Backing off 0.8s...")
+                    await asyncio.sleep(0.8)
                     continue
                 logger.warning(f"[Gemini Error] Model '{model_name}' failed ({type(e).__name__}: {e}). Trying fallback model...")
                 break
