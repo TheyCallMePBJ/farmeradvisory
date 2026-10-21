@@ -173,6 +173,15 @@ async def download_media(media_id: str) -> tuple[bytes, str]:
     audio_stream = await client.get(data.get("url"), headers=headers, timeout=20.0)
     return audio_stream.content, data.get("mime_type", "audio/ogg").split(";")[0]
 
+async def mark_as_read(msg_id: str):
+    if not msg_id:
+        return
+    await send_whatsapp({
+        "messaging_product": "whatsapp",
+        "status": "read",
+        "message_id": msg_id
+    })
+
 # --- Weather API Helper ---
 async def get_district_weather(district: str) -> dict | None:
     if not OPENWEATHER_API_KEY:
@@ -191,7 +200,7 @@ async def get_district_weather(district: str) -> dict | None:
     }
     try:
         client = await get_http_client()
-        r = await client.get(url, params=params, timeout=4.0)
+        r = await client.get(url, params=params, timeout=2.0)
         if r.status_code == 200:
             data = r.json()
             weather_info = {
@@ -335,19 +344,22 @@ Strict Formatting & Content Rules:
     config = types.GenerateContentConfig(
         system_instruction=system_instruction,
         temperature=0.2,
-        max_output_tokens=700,
+        max_output_tokens=450,
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    for attempt in range(2):
+    target_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    max_retries = 3
+
+    for attempt in range(max_retries):
         try:
             res = await asyncio.wait_for(
                 ai_client.aio.models.generate_content(
-                    model="gemini-3.8-flash",
+                    model=target_model,
                     contents=contents,
                     config=config,
                 ),
-                timeout=12.0
+                timeout=8.0  # Snappy 8-second timeout per attempt
             )
 
             reply_text = ""
@@ -361,11 +373,24 @@ Strict Formatting & Content Rules:
                 return cleaned
 
         except asyncio.TimeoutError:
-            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1} timed out after 12s")
+            logger.warning(f"[Gemini Timeout] Attempt {attempt + 1}/{max_retries} timed out after 8s.")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5)
         except Exception as e:
-            logger.exception(f"[Gemini Exception] Attempt {attempt + 1}: {e}")
-            if attempt == 0:
-                await asyncio.sleep(1.0)
+            err_msg = str(e).lower()
+            # 503 Service Unavailable / Model Overloaded: wait briefly and retry
+            if "503" in err_msg or "overloaded" in err_msg or "unavailable" in err_msg:
+                wait_time = 0.8 * (2 ** attempt)  # 0.8s, 1.6s
+                logger.warning(f"[Gemini 503 Overloaded] Attempt {attempt + 1}/{max_retries}. Backing off for {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+            elif "429" in err_msg or "resource_exhausted" in err_msg:
+                wait_time = 1.2 * (2 ** attempt)  # 1.2s, 2.4s
+                logger.warning(f"[Gemini 429 Rate Limit] Attempt {attempt + 1}/{max_retries}. Backing off for {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.exception(f"[Gemini Unexpected Error] Attempt {attempt + 1}/{max_retries}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
 
     # Fallback message matching target language
     if target_lang == "hi":
@@ -413,6 +438,11 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                 return
             if msg_type == "text" and text_content:
                 last_user_queries[sender] = (text_content, now)
+
+            # Send instant WhatsApp read receipt (blue ticks) so user knows message was received
+            msg_id = raw_data.get("id")
+            if msg_id:
+                asyncio.create_task(mark_as_read(msg_id))
 
             if not farmer or text_content.lower() in ["reset", "restart", "start"]:
                 logger.info("Starting onboarding / language selection")
@@ -467,7 +497,7 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                     return
 
             # 3. Post-Onboarding: Direct LLM Queries (Text or Voice)
-            history = await db.get_recent_history(sender, limit=4)
+            history = await db.get_recent_history(sender, limit=2)
             user_log = ""
             bot_reply = ""
 
