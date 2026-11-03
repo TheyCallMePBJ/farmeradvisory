@@ -30,15 +30,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("krishi_saathi")
 
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+def _clean_env(val: str | None) -> str | None:
+    if not val:
+        return None
+    val = val.strip()
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1].strip()
+    return val or None
+
+META_ACCESS_TOKEN = _clean_env(os.getenv("META_ACCESS_TOKEN"))
+PHONE_NUMBER_ID = _clean_env(os.getenv("PHONE_NUMBER_ID"))
+VERIFY_TOKEN = _clean_env(os.getenv("VERIFY_TOKEN"))
+GEMINI_API_KEY = _clean_env(os.getenv("GEMINI_API_KEY"))
+OPENWEATHER_API_KEY = _clean_env(os.getenv("OPENWEATHER_API_KEY"))
 
 GRAPH_API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # --- Concurrency & Weather Cache ---
 user_locks = defaultdict(asyncio.Lock)
@@ -130,6 +138,39 @@ async def health():
         "gemini_configured": bool(GEMINI_API_KEY),
         "weather_configured": bool(OPENWEATHER_API_KEY)
     }
+
+# --- Direct Outbound Test Endpoint (Instant verification of Meta token & recipient) ---
+@app.get("/test-outbound")
+async def test_outbound(to: str = Query(..., description="Phone number with country code, e.g. 919876543210")):
+    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        return {
+            "status": "error",
+            "message": "META_ACCESS_TOKEN or PHONE_NUMBER_ID is missing from environment variables."
+        }
+    target = to.strip().replace("+", "")
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": target,
+        "type": "text",
+        "text": {"body": "✅ Krishi Saathi: Meta Cloud API outbound test message delivered successfully!"}
+    }
+    client = await get_http_client()
+    try:
+        r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=10.0)
+        try:
+            resp_data = r.json()
+        except Exception:
+            resp_data = r.text
+        return {
+            "http_status": r.status_code,
+            "success": r.status_code == 200,
+            "meta_response": resp_data,
+            "target": target,
+            "graph_url": GRAPH_API_URL
+        }
+    except Exception as e:
+        return {"status": "exception", "error": str(e)}
 
 # --- WhatsApp API Outbound Helpers ---
 async def send_whatsapp(payload: dict):
@@ -472,11 +513,20 @@ STRICT INSTRUCTIONS:
         max_output_tokens=max_tokens,
     )
 
+    if not ai_client:
+        logger.error("Gemini API key is not configured!")
+        if target_lang == "hi":
+            return "क्षमा करें, उत्तर प्राप्त करने में समस्या आ रही है। कृपया कुछ क्षण बाद पुनः प्रयास करें।"
+        elif target_lang == "en":
+            return "Sorry, having trouble generating an advisory right now. Please try again in a moment."
+        else:
+            return "क्षमस्व, उत्तर मिळवण्यात अडचण येत आहे. कृपया थोड्या वेळाने प्रयत्न करा."
+
     # Dynamic model fallback chain:
-    # Uses verified available 3.x Flash-Lite models on the free tier
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # Uses verified available Flash models on the current API tier
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     candidate_models = [primary_model]
-    for alt in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
+    for alt in ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]:
         if alt not in candidate_models:
             candidate_models.append(alt)
 
@@ -695,6 +745,8 @@ async def receive(request: Request, bg: BackgroundTasks):
         logger.error(f"Webhook POST: Invalid JSON received: {e}")
         return {"status": "invalid_json"}
 
+    logger.info(f"===> WEBHOOK POST RECEIVED: {data}")
+
     try:
         entries = data.get("entry", [])
         if not entries:
@@ -703,6 +755,16 @@ async def receive(request: Request, bg: BackgroundTasks):
         for entry in entries:
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                
+                # Check for Meta delivery status updates (e.g. failed, read, delivered)
+                statuses = value.get("statuses", [])
+                for s in statuses:
+                    s_status = s.get("status")
+                    if s_status == "failed":
+                        logger.error(f"[Meta Delivery FAILED]: msg_id={s.get('id')}, recipient={s.get('recipient_id')}, errors={s.get('errors')}")
+                    else:
+                        logger.info(f"[Meta Status Update]: msg_id={s.get('id')}, status={s_status}")
+
                 messages = value.get("messages", [])
 
                 for msg in messages:
