@@ -176,35 +176,58 @@ async def test_outbound(to: str = Query(..., description="Phone number with coun
 
 # --- WABA Webhook Subscription Diagnostic & Auto-Fix ---
 @app.get("/subscribe-waba")
-async def subscribe_waba():
-    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        return {"status": "error", "message": "META_ACCESS_TOKEN or PHONE_NUMBER_ID missing"}
+async def subscribe_waba(waba_id: str = Query(None, description="Optional WABA ID from Meta Developer Portal")):
+    if not META_ACCESS_TOKEN:
+        return {"status": "error", "message": "META_ACCESS_TOKEN is missing"}
     client = await get_http_client()
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
     
-    # 1. Fetch WABA ID associated with this phone number
-    phone_url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}?fields=display_phone_number,whatsapp_business_account"
-    r_phone = await client.get(phone_url, headers=headers)
-    phone_data = r_phone.json()
-    waba_id = phone_data.get("whatsapp_business_account", {}).get("id")
-    if not waba_id:
-        return {"status": "error", "message": "Could not fetch WABA ID", "phone_details": phone_data}
-        
-    # 2. Check current subscriptions
-    sub_url = f"https://graph.facebook.com/v21.0/{waba_id}/subscribed_apps"
-    r_sub = await client.get(sub_url, headers=headers)
-    sub_data = r_sub.json()
+    resolved_waba_id = waba_id.strip() if waba_id else None
+    debug_info = None
     
-    # 3. Explicitly subscribe this App to the WABA
+    # 1. If not passed as query param, discover WABA ID from debug_token
+    if not resolved_waba_id:
+        try:
+            debug_url = f"https://graph.facebook.com/v21.0/debug_token?input_token={META_ACCESS_TOKEN}&access_token={META_ACCESS_TOKEN}"
+            r_debug = await client.get(debug_url)
+            debug_info = r_debug.json()
+            granular = debug_info.get("data", {}).get("granular_scopes", [])
+            for g in granular:
+                if g.get("scope") in ["whatsapp_business_messaging", "whatsapp_business_management"]:
+                    targets = g.get("target_ids", [])
+                    if targets:
+                        resolved_waba_id = str(targets[0])
+                        break
+        except Exception as e:
+            debug_info = {"error": str(e)}
+
+    # 2. If still not found, ask user to supply waba_id query param
+    if not resolved_waba_id:
+        return {
+            "status": "error",
+            "message": "Could not auto-detect WABA ID. Please pass it manually: /subscribe-waba?waba_id=<YOUR_WABA_ID>",
+            "how_to_find": "Go to Meta Developer Portal > WhatsApp > API Setup > look for 'WhatsApp Business Account ID' (15-16 digit number)",
+            "token_debug_info": debug_info
+        }
+        
+    sub_url = f"https://graph.facebook.com/v21.0/{resolved_waba_id}/subscribed_apps"
+    r_sub = await client.get(sub_url, headers=headers)
+    try:
+        sub_data = r_sub.json()
+    except Exception:
+        sub_data = r_sub.text
+    
     r_post = await client.post(sub_url, headers=headers)
-    post_data = r_post.json()
+    try:
+        post_data = r_post.json()
+    except Exception:
+        post_data = r_post.text
     
     return {
-        "phone_number_id": PHONE_NUMBER_ID,
-        "phone_details": phone_data,
-        "waba_id": waba_id,
-        "previous_subscriptions": sub_data,
-        "subscribe_result": post_data
+        "status": "success" if (isinstance(post_data, dict) and post_data.get("success")) else "result",
+        "waba_id": resolved_waba_id,
+        "existing_subscriptions": sub_data,
+        "subscription_result": post_data
     }
 
 # --- Database Reset Helper Endpoint ---
