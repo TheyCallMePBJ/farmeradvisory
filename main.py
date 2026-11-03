@@ -36,6 +36,8 @@ def _clean_env(val: str | None) -> str | None:
     val = val.strip()
     if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
         val = val[1:-1].strip()
+    if val.startswith("Bearer "):
+        val = val[7:].strip()
     return val or None
 
 META_ACCESS_TOKEN = _clean_env(os.getenv("META_ACCESS_TOKEN"))
@@ -171,6 +173,47 @@ async def test_outbound(to: str = Query(..., description="Phone number with coun
         }
     except Exception as e:
         return {"status": "exception", "error": str(e)}
+
+# --- WABA Webhook Subscription Diagnostic & Auto-Fix ---
+@app.get("/subscribe-waba")
+async def subscribe_waba():
+    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
+        return {"status": "error", "message": "META_ACCESS_TOKEN or PHONE_NUMBER_ID missing"}
+    client = await get_http_client()
+    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+    
+    # 1. Fetch WABA ID associated with this phone number
+    phone_url = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}?fields=display_phone_number,whatsapp_business_account"
+    r_phone = await client.get(phone_url, headers=headers)
+    phone_data = r_phone.json()
+    waba_id = phone_data.get("whatsapp_business_account", {}).get("id")
+    if not waba_id:
+        return {"status": "error", "message": "Could not fetch WABA ID", "phone_details": phone_data}
+        
+    # 2. Check current subscriptions
+    sub_url = f"https://graph.facebook.com/v21.0/{waba_id}/subscribed_apps"
+    r_sub = await client.get(sub_url, headers=headers)
+    sub_data = r_sub.json()
+    
+    # 3. Explicitly subscribe this App to the WABA
+    r_post = await client.post(sub_url, headers=headers)
+    post_data = r_post.json()
+    
+    return {
+        "phone_number_id": PHONE_NUMBER_ID,
+        "phone_details": phone_data,
+        "waba_id": waba_id,
+        "previous_subscriptions": sub_data,
+        "subscribe_result": post_data
+    }
+
+# --- Database Reset Helper Endpoint ---
+@app.get("/reset-user")
+async def reset_user(phone: str = Query(..., description="Phone number with country code, e.g. 919876543210")):
+    target = phone.strip().replace("+", "")
+    await db.reset_farmer(target)
+    last_user_queries.pop(target, None)
+    return {"status": "success", "message": f"Successfully reset SQLite records for user {target}"}
 
 # --- WhatsApp API Outbound Helpers ---
 async def send_whatsapp(payload: dict):
@@ -617,15 +660,16 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
             if msg_id:
                 asyncio.create_task(mark_as_read(msg_id))
 
-            # 1. Silent reset: clears user profile & chat history without sending any message
+            # 1. Reset: clears user profile & chat history and restarts onboarding
             if text_content.lower() in ["reset", "restart"]:
-                logger.info(f"Silently resetting user {sender} data")
+                logger.info(f"Resetting user {sender} data and restarting onboarding")
                 await db.reset_farmer(sender)
                 last_user_queries.pop(sender, None)
+                await start_language_selection(sender)
                 return
 
-            # 2. First-time user (or freshly reset user sending their next message, e.g. 'hi')
-            if not farmer or text_content.lower() == "start":
+            # 2. First-time user, greeting, or incomplete onboarding restart
+            if not farmer or (not farmer.get("onboarding_complete", 0) and text_content.lower() in ["start", "hi", "hello", "namaste", "hey"]):
                 logger.info("Starting onboarding / language selection")
                 await start_language_selection(sender)
                 return
@@ -640,8 +684,17 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                 # Step 1: Language selection
                 if step == "AWAITING_LANG":
                     btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
-                    lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
-                    chosen_lang = lang_map.get(btn_id, "mr")
+                    clean_text = text_content.lower()
+                    if btn_id == "LANG_MR" or clean_text in ["1", "मराठी", "marathi"]:
+                        chosen_lang = "mr"
+                    elif btn_id == "LANG_HI" or clean_text in ["2", "हिंदी", "hindi"]:
+                        chosen_lang = "hi"
+                    elif btn_id == "LANG_EN" or clean_text in ["3", "english", "en"]:
+                        chosen_lang = "en"
+                    else:
+                        await start_language_selection(sender)
+                        return
+
                     await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
                     
                     next_strings = STRINGS[chosen_lang]
