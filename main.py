@@ -156,103 +156,6 @@ async def health():
         "weather_configured": bool(OPENWEATHER_API_KEY)
     }
 
-# --- Direct Outbound Test Endpoint (Instant verification of Meta token & recipient) ---
-@app.get("/test-outbound")
-async def test_outbound(to: str = Query(..., description="Phone number with country code, e.g. 919876543210")):
-    if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
-        return {
-            "status": "error",
-            "message": "META_ACCESS_TOKEN or PHONE_NUMBER_ID is missing from environment variables."
-        }
-    target = to.strip().replace("+", "")
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": target,
-        "type": "text",
-        "text": {"body": "✅ Krishi Saathi: Meta Cloud API outbound test message delivered successfully!"}
-    }
-    client = await get_http_client()
-    try:
-        r = await client.post(GRAPH_API_URL, headers=headers, json=payload, timeout=10.0)
-        try:
-            resp_data = r.json()
-        except Exception:
-            resp_data = r.text
-        return {
-            "http_status": r.status_code,
-            "success": r.status_code == 200,
-            "meta_response": resp_data,
-            "target": target,
-            "graph_url": GRAPH_API_URL
-        }
-    except Exception as e:
-        return {"status": "exception", "error": str(e)}
-
-# --- WABA Webhook Subscription Diagnostic & Auto-Fix ---
-@app.get("/subscribe-waba")
-async def subscribe_waba(waba_id: str = Query(None, description="Optional WABA ID from Meta Developer Portal")):
-    if not META_ACCESS_TOKEN:
-        return {"status": "error", "message": "META_ACCESS_TOKEN is missing"}
-    client = await get_http_client()
-    headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
-    
-    resolved_waba_id = (waba_id.strip() if waba_id else None) or WABA_ID
-    debug_info = None
-    
-    # 1. If not passed as query param, discover WABA ID from debug_token
-    if not resolved_waba_id:
-        try:
-            debug_url = f"https://graph.facebook.com/v21.0/debug_token?input_token={META_ACCESS_TOKEN}&access_token={META_ACCESS_TOKEN}"
-            r_debug = await client.get(debug_url)
-            debug_info = r_debug.json()
-            granular = debug_info.get("data", {}).get("granular_scopes", [])
-            for g in granular:
-                if g.get("scope") in ["whatsapp_business_messaging", "whatsapp_business_management"]:
-                    targets = g.get("target_ids", [])
-                    if targets:
-                        resolved_waba_id = str(targets[0])
-                        break
-        except Exception as e:
-            debug_info = {"error": str(e)}
-
-    # 2. If still not found, ask user to supply waba_id query param
-    if not resolved_waba_id:
-        return {
-            "status": "error",
-            "message": "Could not auto-detect WABA ID. Please pass it manually: /subscribe-waba?waba_id=<YOUR_WABA_ID>",
-            "how_to_find": "Go to Meta Developer Portal > WhatsApp > API Setup > look for 'WhatsApp Business Account ID' (15-16 digit number)",
-            "token_debug_info": debug_info
-        }
-        
-    sub_url = f"https://graph.facebook.com/v21.0/{resolved_waba_id}/subscribed_apps"
-    r_sub = await client.get(sub_url, headers=headers)
-    try:
-        sub_data = r_sub.json()
-    except Exception:
-        sub_data = r_sub.text
-    
-    r_post = await client.post(sub_url, headers=headers)
-    try:
-        post_data = r_post.json()
-    except Exception:
-        post_data = r_post.text
-    
-    return {
-        "status": "success" if (isinstance(post_data, dict) and post_data.get("success")) else "result",
-        "waba_id": resolved_waba_id,
-        "existing_subscriptions": sub_data,
-        "subscription_result": post_data
-    }
-
-# --- Database Reset Helper Endpoint ---
-@app.get("/reset-user")
-async def reset_user(phone: str = Query(..., description="Phone number with country code, e.g. 919876543210")):
-    target = phone.strip().replace("+", "")
-    await db.reset_farmer(target)
-    last_user_queries.pop(target, None)
-    return {"status": "success", "message": f"Successfully reset SQLite records for user {target}"}
-
 # --- WhatsApp API Outbound Helpers ---
 async def send_whatsapp(payload: dict):
     if not META_ACCESS_TOKEN or not PHONE_NUMBER_ID:
@@ -836,8 +739,6 @@ async def receive(request: Request, bg: BackgroundTasks):
         logger.error(f"Webhook POST: Invalid JSON received: {e}")
         return {"status": "invalid_json"}
 
-    logger.info(f"===> WEBHOOK POST RECEIVED: {data}")
-
     try:
         entries = data.get("entry", [])
         if not entries:
@@ -847,14 +748,11 @@ async def receive(request: Request, bg: BackgroundTasks):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
                 
-                # Check for Meta delivery status updates (e.g. failed, read, delivered)
+                # Log Meta delivery failures if any occur
                 statuses = value.get("statuses", [])
                 for s in statuses:
-                    s_status = s.get("status")
-                    if s_status == "failed":
-                        logger.error(f"[Meta Delivery FAILED]: msg_id={s.get('id')}, recipient={s.get('recipient_id')}, errors={s.get('errors')}")
-                    else:
-                        logger.info(f"[Meta Status Update]: msg_id={s.get('id')}, status={s_status}")
+                    if s.get("status") == "failed":
+                        logger.error(f"[Meta Delivery Failed]: errors={s.get('errors')}")
 
                 messages = value.get("messages", [])
 
