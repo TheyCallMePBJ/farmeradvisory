@@ -42,6 +42,7 @@ def _clean_env(val: str | None) -> str | None:
 
 META_ACCESS_TOKEN = _clean_env(os.getenv("META_ACCESS_TOKEN"))
 PHONE_NUMBER_ID = _clean_env(os.getenv("PHONE_NUMBER_ID"))
+WABA_ID = _clean_env(os.getenv("WABA_ID"))
 VERIFY_TOKEN = _clean_env(os.getenv("VERIFY_TOKEN"))
 GEMINI_API_KEY = _clean_env(os.getenv("GEMINI_API_KEY"))
 OPENWEATHER_API_KEY = _clean_env(os.getenv("OPENWEATHER_API_KEY"))
@@ -121,6 +122,20 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(15.0, connect=5.0),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
     )
+
+    # Auto-subscribe WABA to app webhooks on startup if configured
+    if WABA_ID and META_ACCESS_TOKEN:
+        try:
+            sub_url = f"https://graph.facebook.com/v21.0/{WABA_ID}/subscribed_apps"
+            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+            r_sub = await http_client.post(sub_url, headers=headers, timeout=10.0)
+            if r_sub.status_code == 200 and r_sub.json().get("success"):
+                logger.info(f"Auto-subscribed WABA {WABA_ID} to app webhooks successfully.")
+            else:
+                logger.warning(f"Auto-subscribe WABA returned: {r_sub.text}")
+        except Exception as e:
+            logger.warning(f"Could not auto-subscribe WABA on startup: {e}")
+
     yield
     logger.info("Shutting down Krishi Saathi...")
     if http_client and not http_client.is_closed:
@@ -182,7 +197,7 @@ async def subscribe_waba(waba_id: str = Query(None, description="Optional WABA I
     client = await get_http_client()
     headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
     
-    resolved_waba_id = waba_id.strip() if waba_id else None
+    resolved_waba_id = (waba_id.strip() if waba_id else None) or WABA_ID
     debug_info = None
     
     # 1. If not passed as query param, discover WABA ID from debug_token
