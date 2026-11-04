@@ -37,6 +37,7 @@ Create a `.env` file in the project root:
 ```env
 META_ACCESS_TOKEN=your_meta_system_user_access_token
 PHONE_NUMBER_ID=your_whatsapp_phone_number_id
+WABA_ID=your_messaging_account_id_or_waba_id
 VERIFY_TOKEN=krishi_saathi_secret_token_123
 OPENWEATHER_API_KEY=your_openweather_api_key
 GEMINI_API_KEY=your_gemini_api_key

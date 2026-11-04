@@ -30,15 +30,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("krishi_saathi")
 
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+def _clean_env(val: str | None) -> str | None:
+    if not val:
+        return None
+    val = val.strip()
+    if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+        val = val[1:-1].strip()
+    if val.startswith("Bearer "):
+        val = val[7:].strip()
+    return val or None
+
+META_ACCESS_TOKEN = _clean_env(os.getenv("META_ACCESS_TOKEN"))
+PHONE_NUMBER_ID = _clean_env(os.getenv("PHONE_NUMBER_ID"))
+WABA_ID = _clean_env(os.getenv("WABA_ID"))
+VERIFY_TOKEN = _clean_env(os.getenv("VERIFY_TOKEN"))
+GEMINI_API_KEY = _clean_env(os.getenv("GEMINI_API_KEY"))
+OPENWEATHER_API_KEY = _clean_env(os.getenv("OPENWEATHER_API_KEY"))
 
 GRAPH_API_URL = f"https://graph.facebook.com/v21.0/{PHONE_NUMBER_ID}/messages"
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # --- Concurrency & Weather Cache ---
 user_locks = defaultdict(asyncio.Lock)
@@ -111,6 +122,20 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(15.0, connect=5.0),
         limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
     )
+
+    # Auto-subscribe WABA to app webhooks on startup if configured
+    if WABA_ID and META_ACCESS_TOKEN:
+        try:
+            sub_url = f"https://graph.facebook.com/v21.0/{WABA_ID}/subscribed_apps"
+            headers = {"Authorization": f"Bearer {META_ACCESS_TOKEN}"}
+            r_sub = await http_client.post(sub_url, headers=headers, timeout=10.0)
+            if r_sub.status_code == 200 and r_sub.json().get("success"):
+                logger.info(f"Auto-subscribed WABA {WABA_ID} to app webhooks successfully.")
+            else:
+                logger.warning(f"Auto-subscribe WABA returned: {r_sub.text}")
+        except Exception as e:
+            logger.warning(f"Could not auto-subscribe WABA on startup: {e}")
+
     yield
     logger.info("Shutting down Krishi Saathi...")
     if http_client and not http_client.is_closed:
@@ -472,11 +497,20 @@ STRICT INSTRUCTIONS:
         max_output_tokens=max_tokens,
     )
 
+    if not ai_client:
+        logger.error("Gemini API key is not configured!")
+        if target_lang == "hi":
+            return "क्षमा करें, उत्तर प्राप्त करने में समस्या आ रही है। कृपया कुछ क्षण बाद पुनः प्रयास करें।"
+        elif target_lang == "en":
+            return "Sorry, having trouble generating an advisory right now. Please try again in a moment."
+        else:
+            return "क्षमस्व, उत्तर मिळवण्यात अडचण येत आहे. कृपया थोड्या वेळाने प्रयत्न करा."
+
     # Dynamic model fallback chain:
-    # Uses verified available 3.x Flash-Lite models on the free tier
-    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    # Uses verified available Flash models on the current API tier
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     candidate_models = [primary_model]
-    for alt in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]:
+    for alt in ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite"]:
         if alt not in candidate_models:
             candidate_models.append(alt)
 
@@ -567,15 +601,16 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
             if msg_id:
                 asyncio.create_task(mark_as_read(msg_id))
 
-            # 1. Silent reset: clears user profile & chat history without sending any message
+            # 1. Reset: clears user profile & chat history and restarts onboarding
             if text_content.lower() in ["reset", "restart"]:
-                logger.info(f"Silently resetting user {sender} data")
+                logger.info(f"Resetting user {sender} data and restarting onboarding")
                 await db.reset_farmer(sender)
                 last_user_queries.pop(sender, None)
+                await start_language_selection(sender)
                 return
 
-            # 2. First-time user (or freshly reset user sending their next message, e.g. 'hi')
-            if not farmer or text_content.lower() == "start":
+            # 2. First-time user, greeting, or incomplete onboarding restart
+            if not farmer or (not farmer.get("onboarding_complete", 0) and text_content.lower() in ["start", "hi", "hello", "namaste", "hey"]):
                 logger.info("Starting onboarding / language selection")
                 await start_language_selection(sender)
                 return
@@ -590,8 +625,17 @@ async def dispatch_message(sender: str, msg_type: str, raw_data: dict):
                 # Step 1: Language selection
                 if step == "AWAITING_LANG":
                     btn_id = raw_data.get("interactive", {}).get("button_reply", {}).get("id", "")
-                    lang_map = {"LANG_MR": "mr", "LANG_HI": "hi", "LANG_EN": "en"}
-                    chosen_lang = lang_map.get(btn_id, "mr")
+                    clean_text = text_content.lower()
+                    if btn_id == "LANG_MR" or clean_text in ["1", "मराठी", "marathi"]:
+                        chosen_lang = "mr"
+                    elif btn_id == "LANG_HI" or clean_text in ["2", "हिंदी", "hindi"]:
+                        chosen_lang = "hi"
+                    elif btn_id == "LANG_EN" or clean_text in ["3", "english", "en"]:
+                        chosen_lang = "en"
+                    else:
+                        await start_language_selection(sender)
+                        return
+
                     await db.save_or_update_farmer(sender, language=chosen_lang, onboarding_step="AWAITING_VARIETY")
                     
                     next_strings = STRINGS[chosen_lang]
@@ -703,6 +747,13 @@ async def receive(request: Request, bg: BackgroundTasks):
         for entry in entries:
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+                
+                # Log Meta delivery failures if any occur
+                statuses = value.get("statuses", [])
+                for s in statuses:
+                    if s.get("status") == "failed":
+                        logger.error(f"[Meta Delivery Failed]: errors={s.get('errors')}")
+
                 messages = value.get("messages", [])
 
                 for msg in messages:
